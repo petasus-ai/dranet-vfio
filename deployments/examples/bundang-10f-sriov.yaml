@@ -1,0 +1,37 @@
+# Example pool configuration and DeviceClass for a lab node with a
+# ConnectX-6 Lx: Ethernet VFs on the 25G PF plus a whole-PF passthrough.
+#
+# The ConfigMap is installation-owned (authored at provisioning time); the
+# management platform reads it for pool validation but never writes it.
+# DeviceClass naming follows the management platform's convention: the
+# resource name "petasus.io/<pool>" becomes DeviceClass "<pool>.petasus.io".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dranet-vfio-config
+  namespace: dra-system
+data:
+  config.yaml: |
+    pools:
+      - name: vf-25
+        pfNames: [enp8s0f0np0]
+        pfNamesByNode:
+          bundang-10f-33: [ens2f0np0]
+      - name: ib-compute
+        linkType: infiniband
+        pfNames: [ibp12s0]
+      - name: dpdk-uplink
+        kind: pf
+        pciAddresses: ["0000:51:00.1"]
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: vf-25.petasus.io
+spec:
+  selectors:
+    - cel:
+        expression: >-
+          device.driver == "vfio.petasus.io" &&
+          "resourceName" in device.attributes["k8s.cni.cncf.io"] &&
+          device.attributes["k8s.cni.cncf.io"].resourceName == "petasus.io/vf-25"

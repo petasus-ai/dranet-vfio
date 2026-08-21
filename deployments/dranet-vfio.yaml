@@ -1,0 +1,181 @@
+# dranet-vfio: DRA kubelet plugin that advertises vfio-pci-bound
+# Ethernet/InfiniBand PF/VF functions as pool devices, applies Ethernet-VF
+# host configuration (MAC/VLAN via the PF, representor bridging in
+# switchdev mode), and injects the /dev/vfio character devices plus the
+# KEP-5304 PCI-address metadata into consuming pods. Pool definitions come
+# from the dranet-vfio-config ConfigMap; the file is re-read periodically,
+# so pool edits and newly bound devices need no driver restart.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: dranet-vfio
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+      - update
+  - apiGroups:
+      - "resource.k8s.io"
+    resources:
+      - resourceslices
+    verbs:
+      - list
+      - watch
+      - create
+      - update
+      - delete
+  - apiGroups:
+      - "resource.k8s.io"
+    resources:
+      - resourceclaims
+      - deviceclasses
+    verbs:
+      - get
+  - apiGroups:
+      - "resource.k8s.io"
+    resources:
+      - resourceclaims/status
+    verbs:
+      - patch
+      - update
+  - apiGroups:
+      - "resource.k8s.io"
+    resources:
+      - resourceclaims/driver
+    verbs:
+      - associated-node:patch
+      - associated-node:update
+    resourceNames:
+      - vfio.petasus.io
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: dranet-vfio
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dranet-vfio
+subjects:
+  - kind: ServiceAccount
+    name: dranet-vfio
+    namespace: dra-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dranet-vfio
+  namespace: dra-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dranet-vfio
+  namespace: dra-system
+  labels:
+    app: dranet-vfio
+spec:
+  selector:
+    matchLabels:
+      app: dranet-vfio
+  template:
+    metadata:
+      labels:
+        app: dranet-vfio
+    spec:
+      # No control-plane toleration: VMs never schedule there, so the driver
+      # doesn't either.
+      hostNetwork: true
+      serviceAccountName: dranet-vfio
+      containers:
+        - name: dranet-vfio
+          args:
+            - /dranet
+            - --v=4
+            - --hostname-override=$(NODE_NAME)
+          image: quay.io/edgestack/dranet-vfio:v0.1.0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "50Mi"
+          securityContext:
+            privileged: true
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 9177
+            failureThreshold: 12
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9177
+          volumeMounts:
+            # Mounted 1:1 so the KEP-5304 metadata files the driver writes
+            # under plugins/vfio.petasus.io/dra-device-metadata have the same
+            # path in-container and on the host (the bind-mount source).
+            - name: kubelet-plugins
+              mountPath: /var/lib/kubelet/plugins
+            - name: plugin-registry
+              mountPath: /var/lib/kubelet/plugins_registry
+            - name: nri-plugin
+              mountPath: /var/run/nri
+            - name: netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+            # /dev/vfio/<group> nodes are stat'ed to build the container
+            # device specs injected into consuming pods.
+            - name: dev
+              mountPath: /dev
+              mountPropagation: HostToContainer
+            # Host /var/run: the per-bridge flock files live here so a
+            # host-installed sriov-vfio CNI and this driver serialize
+            # bridge-VLAN edits against the same inodes.
+            - name: host-var-run
+              mountPath: /host/var/run
+            - name: state
+              mountPath: /var/run/dranet-vfio
+            - name: config
+              mountPath: /etc/dranet-vfio
+              readOnly: true
+      volumes:
+        - name: kubelet-plugins
+          hostPath:
+            path: /var/lib/kubelet/plugins
+        - name: plugin-registry
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+        - name: nri-plugin
+          hostPath:
+            path: /var/run/nri
+        - name: netns
+          hostPath:
+            path: /var/run/netns
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: host-var-run
+          hostPath:
+            path: /var/run
+        - name: state
+          hostPath:
+            path: /var/run/dranet-vfio
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: dranet-vfio-config

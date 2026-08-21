@@ -94,8 +94,10 @@ func (np *NetworkDriver) CreateContainer(ctx context.Context, pod *api.PodSandbo
 }
 
 func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _ *api.Container, podConfig PodConfig) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	// Containers only care about the RDMA char devices.
+	// Containers only care about the RDMA/vfio char devices and the
+	// device metadata mounts.
 	devPaths := set.Set[string]{}
+	mountDsts := set.Set[string]{}
 	adjust := &api.ContainerAdjustment{}
 
 	for _, config := range podConfig.DeviceConfigs {
@@ -111,6 +113,36 @@ func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _
 				Type:  dev.Type,
 				Major: dev.Major,
 				Minor: dev.Minor,
+			})
+		}
+		// Inject the vfio character devices owned by qemu so virt-launcher
+		// can hand the passthrough NIC to the VM. /dev/vfio/vfio is shared
+		// between devices, hence the path dedup.
+		for i := range config.VfioDevices {
+			dev := &config.VfioDevices[i]
+			if devPaths.Has(dev.Path) {
+				continue
+			}
+			devPaths.Insert(dev.Path)
+			adjust.AddDevice(&api.LinuxDevice{
+				Path:     dev.Path,
+				Type:     dev.Type,
+				Major:    dev.Major,
+				Minor:    dev.Minor,
+				FileMode: api.FileMode(dev.FileMode),
+				Uid:      api.UInt32(dev.UID),
+				Gid:      api.UInt32(dev.GID),
+			})
+		}
+		// Bind-mount the KEP-5304 metadata file virt-launcher resolves the
+		// device's PCI address from.
+		if m := config.MetadataMount; m != nil && !mountDsts.Has(m.ContainerPath) {
+			mountDsts.Insert(m.ContainerPath)
+			adjust.AddMount(&api.Mount{
+				Destination: m.ContainerPath,
+				Source:      m.HostPath,
+				Type:        "bind",
+				Options:     []string{"rbind", "ro"},
 			})
 		}
 	}
@@ -203,6 +235,19 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 				metav1apply.Condition().
 					WithType("Ready").
 					WithReason("RDMAOnlyDeviceReady").
+					WithStatus(metav1.ConditionTrue).
+					WithLastTransitionTime(metav1.Now()),
+			)
+		}
+
+		// Block 4: VFIO passthrough devices have no netdev either; the
+		// char-device injection (createContainer) is the attachment, so
+		// the device is ready here.
+		if config.VfioPCIAddress != "" {
+			resourceClaimStatusDevice.WithConditions(
+				metav1apply.Condition().
+					WithType("Ready").
+					WithReason("VFIODeviceReady").
 					WithStatus(metav1.ConditionTrue).
 					WithLastTransitionTime(metav1.Now()),
 			)

@@ -1,3 +1,94 @@
+# dranet-vfio
+
+DRA driver (fork of [kubernetes-sigs/dranet](https://github.com/kubernetes-sigs/dranet))
+that gives KubeVirt VMs VFIO-PCI passthrough NICs — Ethernet and InfiniBand,
+PF and VF alike — allocated through `resource.k8s.io/v1`. No CNI, no Multus,
+no device plugin.
+
+Driver name: `vfio.petasus.io`.
+
+## How it works
+
+- Hardware is discovered from sysfs: every PCI function bound to `vfio-pci`
+  whose class is a network controller (`0x02xx`/`0x0c06xx`). Which devices
+  are exposed — and under which pool — is defined in a ConfigMap-backed
+  config file (`--config`, default `/etc/dranet-vfio/config.yaml`):
+
+  ```yaml
+  pools:
+    - name: vf-25                    # Ethernet VFs by parent PF netdev
+      pfNames: [enp8s0f0np0]
+      pfNamesByNode:
+        bundang-10f-33: [ens2f0np0]  # per-node override
+    - name: ib-compute               # InfiniBand VFs (pure passthrough)
+      linkType: infiniband
+      pfNames: [ibp12s0]
+    - name: dpdk-uplink              # whole-PF passthrough by PCI address
+      kind: pf
+      pciAddresses: ["0000:51:00.1"]
+  ```
+
+  Each device is published as a ResourceSlice device `pci-<bdf>` with the
+  attributes `k8s.cni.cncf.io/resourceName` (default `petasus.io/<pool>`),
+  the standard `resource.kubernetes.io/pciBusID`, and
+  `vfio.petasus.io/{pool,kind,linkType,vendor,deviceID,pfName,pfPciAddress,vfIndex,iommuGroup,pciClass,numaNode,deviceType}`.
+  The file is re-read periodically (`--config-reload-interval`), which also
+  rescans the hardware, so pool edits and newly bound devices need no driver
+  restart.
+
+- On `NodePrepareResources` the driver validates the device (vfio-pci
+  binding, network PCI class, IOMMU-group viability) and applies the claim's
+  VF settings on the host — the behavior of the sriov-vfio CNI, absorbed:
+
+  - **Ethernet VF, legacy eswitch:** MAC (with read-back verification),
+    VLAN, spoofchk, trust, min/max TX rate via the PF; link state auto.
+  - **Ethernet VF, switchdev eswitch:** the VF representor is attached to
+    the bridge over the uplink (PF or its bond), with MTU inheritance,
+    access-VLAN programming validated against the uplink's bridge-port
+    membership, and per-bridge flock serialization.
+  - **Everything else** (Ethernet PF, InfiniBand PF/VF): pure passthrough,
+    no host configuration; any VF option in the claim fails prepare.
+
+  Original VF settings are captured first and restored on
+  `NodeUnprepareResources`, surviving driver restarts (bbolt, `--db-path`).
+
+- Via NRI, `/dev/vfio/vfio` and `/dev/vfio/<iommu group>` are injected into
+  the pod's containers owned by uid/gid 107 (qemu in virt-launcher), and the
+  KEP-5304 device metadata file is bind-mounted at
+  `/var/run/kubernetes.io/dra-device-attributes/resourceclaims/<claim>/<request>/vfio.petasus.io-metadata.json`,
+  where KubeVirt's DRA path reads `resource.kubernetes.io/pciBusID` to build
+  the libvirt `<hostdev>`.
+
+- VF settings arrive per claim via the opaque device config:
+
+  ```yaml
+  config:
+    - requests: ["nic"]
+      opaque:
+        driver: vfio.petasus.io
+        parameters:
+          mac: "02:00:00:aa:bb:cc"   # omitted for InfiniBand
+          vlan: 1234                 # network segment ID; 0/omitted = untagged
+          # spoofchk/trust ("on"|"off"), minTxRate/maxTxRate (Mbps),
+          # bridge (switchdev auto-detection override) — all optional
+  ```
+
+KubeVirt consumes the device with `interfaces[].sriov: {}` and
+`spec.networks[].resourceClaim` (`NetworkDevicesWithDRA` feature gate); the
+PCI address flows through the metadata file, not a network-status
+annotation.
+
+## Deploy
+
+```sh
+kubectl apply -f deployments/dranet-vfio.yaml
+kubectl apply -f deployments/examples/bundang-10f-sriov.yaml   # pools + DeviceClass
+```
+
+The upstream dranet documentation below describes the inherited machinery.
+
+---
+
 # DRANET: DRA Kubernetes Network Driver
 
 DRANET is a Kubernetes Network Driver that uses Dynamic Resource Allocation

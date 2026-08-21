@@ -27,6 +27,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
+	"sigs.k8s.io/dranet/pkg/vfio"
+	"sigs.k8s.io/dranet/pkg/vfio/metadata"
 
 	"github.com/containerd/nri/pkg/stub"
 	"sigs.k8s.io/dranet/internal/nlwrap"
@@ -103,6 +105,14 @@ func WithKubeletRootDir(dir string) Option {
 	}
 }
 
+// WithVFLockDir sets the directory holding the per-bridge flock files that
+// serialize bridge-VLAN edits on switchdev VFs.
+func WithVFLockDir(dir string) Option {
+	return func(o *NetworkDriver) {
+		o.vfLockDir = dir
+	}
+}
+
 type NetworkDriver struct {
 	draPlugin     pluginHelper
 	driverName    string
@@ -123,6 +133,12 @@ type NetworkDriver struct {
 	// kubeletRootDir is the kubelet data directory (its --root-dir). Set when the
 	// kubelet runs with a non-default --root-dir.
 	kubeletRootDir string
+
+	// VFIO passthrough machinery: host-side VF configuration and the
+	// KEP-5304 metadata files virt-launcher reads PCI addresses from.
+	vfLockDir      string
+	vfioConfigurer *vfio.Configurer
+	vfioMetadata   *metadata.Writer
 
 	clock clock.WithTicker // Injectable clock for testing
 }
@@ -181,6 +197,15 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	if err != nil {
 		return nil, fmt.Errorf("failed to create plugin path %s: %v", driverPluginPath, err)
 	}
+
+	// The metadata files live below the plugin data directory: the host
+	// path (containerd's bind-mount source) and the in-container path are
+	// identical because the DaemonSet mounts /var/lib/kubelet/plugins 1:1.
+	if plugin.vfLockDir == "" {
+		plugin.vfLockDir = "/var/run"
+	}
+	plugin.vfioConfigurer = vfio.NewConfigurer(vfio.NewSysfs(), vfio.NewNetlink(), plugin.vfLockDir)
+	plugin.vfioMetadata = &metadata.Writer{DriverName: driverName, HostRoot: driverPluginPath}
 
 	// Derive the registration and plugin data directories from the kubelet root
 	// dir so they are correct when the kubelet uses a non-default --root-dir. At

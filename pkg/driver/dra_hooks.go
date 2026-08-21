@@ -205,6 +205,18 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			continue
 		}
 		requestName := result.Request
+
+		// VFIO passthrough device: no netdev exists, and the opaque config
+		// uses this driver's flat VF-settings schema rather than the
+		// generic apis.NetworkConfig, so the device is prepared here in
+		// full and the netdev path below never runs.
+		if spec, isVfio := vfioSpecOf(np.netdb, result.Device); isVfio {
+			if err := np.prepareVfioDevice(claim, podUID, requestName, result, spec); err != nil {
+				errorList = append(errorList, err)
+			}
+			continue
+		}
+
 		userConf := &apis.NetworkConfig{}
 		for _, config := range claim.Status.Allocation.Devices.Config {
 			// Check there is a config associated to this device
@@ -528,7 +540,19 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 						klog.Errorf("failed to release profile config for claim %v: %v", claim.NamespacedName, err)
 					}
 				}
+				// Restore the host-side VF configuration a vfio prepare
+				// applied (original MAC/VLAN/rates, representor detach).
+				if devCfg.VfioState != nil {
+					np.restoreVfioDevice(deviceName, devCfg)
+				}
 			}
+		}
+	}
+
+	// Idempotent no-op when the claim carried no vfio devices.
+	if np.vfioMetadata != nil {
+		if err := np.vfioMetadata.RemoveClaim(claim.Namespace, claim.Name); err != nil {
+			klog.Errorf("failed to remove device metadata for claim %v: %v", claim.NamespacedName, err)
 		}
 	}
 

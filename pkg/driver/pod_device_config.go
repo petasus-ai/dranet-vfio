@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/dranet/pkg/apis"
+	"sigs.k8s.io/dranet/pkg/vfio"
 )
 
 // PodConfig holds all the device configurations for a Pod, and can be extended
@@ -65,6 +66,29 @@ type DeviceConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+
+	// VfioPCIAddress is the PCI address of the vfio-pci-bound device
+	// prepared for this claim; empty for non-vfio devices.
+	VfioPCIAddress string `json:"vfioPciAddress,omitempty"`
+
+	// VfioState records the host-side VF configuration prepare applied,
+	// with the original settings unprepare restores.
+	VfioState *vfio.HostState `json:"vfioState,omitempty"`
+
+	// VfioDevices are the /dev/vfio character devices injected into the
+	// Pod's containers so qemu can open the passthrough device.
+	VfioDevices []LinuxDevice `json:"vfioDevices,omitempty"`
+
+	// MetadataMount bind-mounts the KEP-5304 device metadata file into the
+	// Pod's containers; virt-launcher reads the PCI address from it.
+	MetadataMount *BindMount `json:"metadataMount,omitempty"`
+}
+
+// BindMount describes one read-only bind mount from the host into the
+// Pod's containers.
+type BindMount struct {
+	HostPath      string `json:"hostPath"`
+	ContainerPath string `json:"containerPath"`
 }
 
 // RDMAConfig contains parameters for setting up an RDMA device associated
