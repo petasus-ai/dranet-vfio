@@ -13,10 +13,16 @@ metadata:
 data:
   config.yaml: |
     pools:
+      # VFs selected by the parent PF's PCI address (stable across netdev
+      # renames; the usual provisioning-time selector).
       - name: vf-25
-        pfNames: [enp8s0f0np0]
+        pfPciAddressesByNode:
+          bundang-10f-33: ["0000:86:00.1"]
+          bundang-10f-35: ["0001:01:00.1"]
+      # VFs selected by the parent PF's netdev name.
+      - name: vf-lag-trunk
         pfNamesByNode:
-          bundang-10f-33: [ens2f0np0]
+          bundang-10f-35: [enp1s0f1np1]
       - name: ib-compute
         linkType: infiniband
         pfNames: [ibp12s0]

@@ -163,6 +163,29 @@ func TestBuildDevicesUnmatchedAndBrokenConfig(t *testing.T) {
 	}
 }
 
+func TestBuildDevicesByPFPciAddress(t *testing.T) {
+	b := inventoryFixture(t)
+
+	config := "pools:\n  - name: by-pf\n    pfPciAddressesByNode:\n      node-1: [\"0000:08:00.0\"]\n"
+	inv := New(writeConfig(t, config), "node-1", WithSysfs(b.ops()))
+	devices, _ := inv.buildDevices()
+	if len(devices) != 2 {
+		t.Fatalf("expected the 2 VFs of 0000:08:00.0, got %v", deviceNames(devices))
+	}
+	for _, dev := range devices {
+		if got := *dev.Attributes[AttrDomain+"/pool"].StringValue; got != "by-pf" {
+			t.Fatalf("expected pool by-pf, got %q", got)
+		}
+	}
+
+	// The same selector matches nothing on a node the map does not list.
+	inv = New(writeConfig(t, config), "node-2", WithSysfs(b.ops()))
+	devices, _ = inv.buildDevices()
+	if len(devices) != 0 {
+		t.Fatalf("expected no devices on an unlisted node, got %v", deviceNames(devices))
+	}
+}
+
 func deviceNames(devices []resourceapi.Device) []string {
 	names := make([]string, 0, len(devices))
 	for _, dev := range devices {

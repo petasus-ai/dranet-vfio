@@ -272,7 +272,7 @@ func (inv *Inventory) matchPool(config *Config, spec *Spec) *PoolConfig {
 	var matched *PoolConfig
 	for i := range config.Pools {
 		pool := &config.Pools[i]
-		if !pool.Matches(inv.nodeName, spec.Kind, spec.LinkType, spec.PFName, spec.PCIAddress) {
+		if !pool.Matches(inv.nodeName, spec.Kind, spec.LinkType, spec.PFName, spec.PFPCIAddress, spec.PCIAddress) {
 			continue
 		}
 		if matched == nil {

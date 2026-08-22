@@ -42,7 +42,8 @@ const (
 // PoolConfig maps discovered vfio-pci-bound network devices into one pool.
 // A device belongs to the pool when its kind and link type match and one of
 // the selectors matches: the parent PF's netdev name is listed in pfNames,
-// or the device's own PCI address matches a pciAddresses glob.
+// the parent PF's PCI address matches a pfPciAddresses glob, or the
+// device's own PCI address matches a pciAddresses glob.
 type PoolConfig struct {
 	// Name identifies the pool. Must be a DNS-1123 label.
 	Name string `json:"name"`
@@ -65,6 +66,14 @@ type PoolConfig struct {
 
 	// PFNamesByNode overrides PFNames for specific node names.
 	PFNamesByNode map[string][]string `json:"pfNamesByNode,omitempty"`
+
+	// PFPciAddresses selects VFs whose parent PF's PCI address matches one
+	// of these globs (path.Match syntax). Only valid for kind "vf": a PF
+	// pool already selects by the device's own address via pciAddresses.
+	PFPciAddresses []string `json:"pfPciAddresses,omitempty"`
+
+	// PFPciAddressesByNode overrides PFPciAddresses for specific node names.
+	PFPciAddressesByNode map[string][]string `json:"pfPciAddressesByNode,omitempty"`
 
 	// PCIAddresses selects devices whose own PCI address matches one of
 	// these globs (path.Match syntax, e.g. "0000:51:00.*").
@@ -95,6 +104,15 @@ func (p *PoolConfig) PFNamesForNode(nodeName string) []string {
 	return p.PFNames
 }
 
+// PFPciAddressesForNode resolves the PF-PCI-address selector for the given
+// node.
+func (p *PoolConfig) PFPciAddressesForNode(nodeName string) []string {
+	if addrs, ok := p.PFPciAddressesByNode[nodeName]; ok {
+		return addrs
+	}
+	return p.PFPciAddresses
+}
+
 // PCIAddressesForNode resolves the PCI-address selector for the given node.
 func (p *PoolConfig) PCIAddressesForNode(nodeName string) []string {
 	if addrs, ok := p.PCIAddressesByNode[nodeName]; ok {
@@ -105,7 +123,7 @@ func (p *PoolConfig) PCIAddressesForNode(nodeName string) []string {
 
 // Matches reports whether a discovered device belongs to this pool on the
 // given node.
-func (p *PoolConfig) Matches(nodeName, kind, linkType, pfName, pciAddress string) bool {
+func (p *PoolConfig) Matches(nodeName, kind, linkType, pfName, pfPciAddress, pciAddress string) bool {
 	if p.KindOrDefault() != kind {
 		return false
 	}
@@ -114,6 +132,14 @@ func (p *PoolConfig) Matches(nodeName, kind, linkType, pfName, pciAddress string
 	}
 	for _, name := range p.PFNamesForNode(nodeName) {
 		if pfName != "" && name == pfName {
+			return true
+		}
+	}
+	for _, glob := range p.PFPciAddressesForNode(nodeName) {
+		if pfPciAddress == "" {
+			break
+		}
+		if ok, err := path.Match(glob, pfPciAddress); err == nil && ok {
 			return true
 		}
 	}
@@ -172,14 +198,20 @@ func (p *PoolConfig) validate() []error {
 		errs = append(errs, fmt.Errorf("pool %q: unsupported linkType %q", p.Name, p.LinkType))
 	}
 	hasPFNames := len(p.PFNames) > 0 || len(p.PFNamesByNode) > 0
+	hasPFPciAddresses := len(p.PFPciAddresses) > 0 || len(p.PFPciAddressesByNode) > 0
 	hasPCIAddresses := len(p.PCIAddresses) > 0 || len(p.PCIAddressesByNode) > 0
-	if !hasPFNames && !hasPCIAddresses {
-		errs = append(errs, fmt.Errorf("pool %q: at least one selector (pfNames or pciAddresses) is required", p.Name))
+	if !hasPFNames && !hasPFPciAddresses && !hasPCIAddresses {
+		errs = append(errs, fmt.Errorf("pool %q: at least one selector (pfNames, pfPciAddresses or pciAddresses) is required", p.Name))
 	}
 	if p.KindOrDefault() == KindPF && hasPFNames {
 		errs = append(errs, fmt.Errorf("pool %q: pfNames selects VFs by parent PF; a vfio-pci-bound PF has no netdev, use pciAddresses", p.Name))
 	}
-	for _, globs := range append([][]string{p.PCIAddresses}, mapValues(p.PCIAddressesByNode)...) {
+	if p.KindOrDefault() == KindPF && hasPFPciAddresses {
+		errs = append(errs, fmt.Errorf("pool %q: pfPciAddresses selects VFs by parent PF; a PF pool selects its own address via pciAddresses", p.Name))
+	}
+	globLists := append([][]string{p.PCIAddresses, p.PFPciAddresses}, mapValues(p.PCIAddressesByNode)...)
+	globLists = append(globLists, mapValues(p.PFPciAddressesByNode)...)
+	for _, globs := range globLists {
 		for _, glob := range globs {
 			if _, err := path.Match(glob, "0000:00:00.0"); err != nil {
 				errs = append(errs, fmt.Errorf("pool %q: invalid pciAddresses glob %q: %v", p.Name, glob, err))

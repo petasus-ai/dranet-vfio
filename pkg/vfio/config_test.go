@@ -82,6 +82,20 @@ pools:
 			wantErr: "use pciAddresses",
 		},
 		{
+			name:    "pf pool with pfPciAddresses",
+			content: "pools:\n  - {name: a, kind: pf, pfPciAddresses: [\"0000:51:00.1\"]}\n",
+			wantErr: "selects its own address via pciAddresses",
+		},
+		{
+			name:    "bad pfPciAddresses glob",
+			content: "pools:\n  - {name: a, pfPciAddresses: [\"0000:[51:00.1\"]}\n",
+			wantErr: "invalid pciAddresses glob",
+		},
+		{
+			name:    "pfPciAddresses only is a valid selector",
+			content: "pools:\n  - {name: a, pfPciAddressesByNode: {node-33: [\"0000:86:00.1\"]}}\n",
+		},
+		{
 			name:    "bad glob",
 			content: "pools:\n  - {name: a, pciAddresses: [\"0000:[51:00.0\"]}\n",
 			wantErr: "invalid pciAddresses glob",
@@ -123,27 +137,39 @@ func TestPoolMatches(t *testing.T) {
 	}
 	ibPool := PoolConfig{Name: "ib", LinkType: LinkTypeInfiniband, PFNames: []string{"ibp12s0"}}
 	pfPool := PoolConfig{Name: "dpdk", Kind: KindPF, PCIAddresses: []string{"0000:51:00.*"}}
+	pfPciPool := PoolConfig{
+		Name:           "by-pf-pci",
+		PFPciAddresses: []string{"0000:86:00.1"},
+		PFPciAddressesByNode: map[string][]string{
+			"node-35": {"0001:01:00.1"},
+		},
+	}
 
 	tests := []struct {
-		name                              string
-		pool                              PoolConfig
-		node, kind, linkType, pfName, pci string
-		want                              bool
+		name                                     string
+		pool                                     PoolConfig
+		node, kind, linkType, pfName, pfPci, pci string
+		want                                     bool
 	}{
-		{"vf by pf name", vfPool, "node-1", KindVF, LinkTypeEthernet, "enp8s0f0np0", "0000:08:00.2", true},
-		{"per-node override wins", vfPool, "node-33", KindVF, LinkTypeEthernet, "ens2f0", "0000:08:00.2", true},
-		{"per-node override replaces default", vfPool, "node-33", KindVF, LinkTypeEthernet, "enp8s0f0np0", "0000:08:00.2", false},
-		{"wrong pf", vfPool, "node-1", KindVF, LinkTypeEthernet, "enp8s0f1np1", "0000:08:00.2", false},
-		{"kind mismatch", vfPool, "node-1", KindPF, LinkTypeEthernet, "", "0000:08:00.0", false},
-		{"linkType filter", ibPool, "node-1", KindVF, LinkTypeEthernet, "ibp12s0", "0000:0c:00.2", false},
-		{"linkType match", ibPool, "node-1", KindVF, LinkTypeInfiniband, "ibp12s0", "0000:0c:00.2", true},
-		{"pf by pci glob", pfPool, "node-1", KindPF, LinkTypeEthernet, "", "0000:51:00.1", true},
-		{"pf glob mismatch", pfPool, "node-1", KindPF, LinkTypeEthernet, "", "0000:52:00.1", false},
-		{"empty pf name never matches pfNames", vfPool, "node-1", KindVF, LinkTypeEthernet, "", "0000:08:00.2", false},
+		{"vf by pf name", vfPool, "node-1", KindVF, LinkTypeEthernet, "enp8s0f0np0", "", "0000:08:00.2", true},
+		{"per-node override wins", vfPool, "node-33", KindVF, LinkTypeEthernet, "ens2f0", "", "0000:08:00.2", true},
+		{"per-node override replaces default", vfPool, "node-33", KindVF, LinkTypeEthernet, "enp8s0f0np0", "", "0000:08:00.2", false},
+		{"wrong pf", vfPool, "node-1", KindVF, LinkTypeEthernet, "enp8s0f1np1", "", "0000:08:00.2", false},
+		{"kind mismatch", vfPool, "node-1", KindPF, LinkTypeEthernet, "", "", "0000:08:00.0", false},
+		{"linkType filter", ibPool, "node-1", KindVF, LinkTypeEthernet, "ibp12s0", "", "0000:0c:00.2", false},
+		{"linkType match", ibPool, "node-1", KindVF, LinkTypeInfiniband, "ibp12s0", "", "0000:0c:00.2", true},
+		{"pf by pci glob", pfPool, "node-1", KindPF, LinkTypeEthernet, "", "", "0000:51:00.1", true},
+		{"pf glob mismatch", pfPool, "node-1", KindPF, LinkTypeEthernet, "", "", "0000:52:00.1", false},
+		{"empty pf name never matches pfNames", vfPool, "node-1", KindVF, LinkTypeEthernet, "", "", "0000:08:00.2", false},
+		{"vf by pf pci", pfPciPool, "node-1", KindVF, LinkTypeEthernet, "ens5f1np1", "0000:86:00.1", "0000:86:0a.0", true},
+		{"vf by pf pci per-node override", pfPciPool, "node-35", KindVF, LinkTypeEthernet, "enP1p1s0f1np1", "0001:01:00.1", "0001:01:08.2", true},
+		{"pf pci override replaces default", pfPciPool, "node-35", KindVF, LinkTypeEthernet, "ens5f1np1", "0000:86:00.1", "0000:86:0a.0", false},
+		{"wrong pf pci", pfPciPool, "node-1", KindVF, LinkTypeEthernet, "enp1s0f1np1", "0000:01:00.1", "0000:01:08.2", false},
+		{"empty pf pci never matches", pfPciPool, "node-1", KindVF, LinkTypeEthernet, "", "", "0000:86:0a.0", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := tc.pool.Matches(tc.node, tc.kind, tc.linkType, tc.pfName, tc.pci)
+			got := tc.pool.Matches(tc.node, tc.kind, tc.linkType, tc.pfName, tc.pfPci, tc.pci)
 			if got != tc.want {
 				t.Fatalf("expected %v, got %v", tc.want, got)
 			}
