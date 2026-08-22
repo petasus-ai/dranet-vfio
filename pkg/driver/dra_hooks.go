@@ -153,6 +153,8 @@ func (np *NetworkDriver) prepareResourceClaims(ctx context.Context, claims []*re
 //
 // TODO(#290): This function has grown too large and needs to be split apart.
 func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+	np.claimOpMu.Lock()
+	defer np.claimOpMu.Unlock()
 	klog.V(2).Infof("PrepareResourceClaim Claim %s/%s", claim.Namespace, claim.Name)
 	start := time.Now()
 	defer func() {
@@ -528,6 +530,8 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 }
 
 func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
+	np.claimOpMu.Lock()
+	defer np.claimOpMu.Unlock()
 	for _, podUID := range np.podConfigStore.ListPods() {
 		podCfg, ok := np.podConfigStore.GetPodConfig(podUID)
 		if !ok {

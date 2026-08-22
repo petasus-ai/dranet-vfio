@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/cel-go/cel"
@@ -139,6 +140,13 @@ type NetworkDriver struct {
 	vfLockDir      string
 	vfioConfigurer *vfio.Configurer
 	vfioMetadata   *metadata.Writer
+
+	// claimOpMu serializes prepare/unprepare claim processing. Kubelet can
+	// overlap an in-flight unprepare with the next pod's prepare of the
+	// same claim (a VM restart): without the lock, unprepare's store
+	// cleanup races the fresh prepare and deletes the new pod's persisted
+	// host state, so the final teardown never restores the device.
+	claimOpMu sync.Mutex
 
 	clock clock.WithTicker // Injectable clock for testing
 }
