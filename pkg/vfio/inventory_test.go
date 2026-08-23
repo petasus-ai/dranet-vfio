@@ -41,11 +41,13 @@ func inventoryFixture(t *testing.T) *sysfsBuilder {
 	// InfiniBand PF with one vfio-bound VF.
 	b.device("0000:0c:00.0", "0x020700", "mlx5_core", "")
 	b.netdev("0000:0c:00.0", "ibp12s0", "")
+	b.infiniband("0000:0c:00.0", "mlx5_1")
 	b.device("0000:0c:00.2", "0x020700", "vfio-pci", "50")
 	b.vf("0000:0c:00.2", "0000:0c:00.0", "0")
 
-	// Whole Ethernet PF bound to vfio-pci (no netdev at all).
+	// Whole Ethernet PF bound to vfio-pci (no netdev at all), Mellanox silicon.
 	b.device("0000:51:00.0", "0x020000", "vfio-pci", "60")
+	b.writeFile("0x15b3", "bus/pci/devices", "0000:51:00.0", "vendor")
 
 	// GPU bound to vfio-pci: not a network class, never advertised.
 	b.device("0000:65:00.0", "0x030200", "vfio-pci", "70")
@@ -103,6 +105,10 @@ func TestBuildDevices(t *testing.T) {
 	if got := *attrs[AttrDomain+"/iommuGroup"].IntValue; got != 42 {
 		t.Fatalf("unexpected iommuGroup: %d", got)
 	}
+	// No RDMA node on the PF and no Mellanox vendor id -> not RDMA-capable.
+	if got := *attrs[AttrDomain+"/rdmaCapable"].BoolValue; got {
+		t.Fatal("plain Ethernet VF must not be rdmaCapable")
+	}
 	spec := specs["pci-0000-08-00-2"]
 	if spec.Pool != "sriov-a" || spec.PFPCIAddress != "0000:08:00.0" || spec.VFIndex != 0 || spec.IOMMUGroup != 42 {
 		t.Fatalf("unexpected spec: %#v", spec)
@@ -116,6 +122,10 @@ func TestBuildDevices(t *testing.T) {
 	if got := *devices[idx].Attributes[AttrResourceName].StringValue; got != "petasus.io/ib-compute" {
 		t.Fatalf("unexpected IB resourceName: %q", got)
 	}
+	// The vfio-bound VF inherits RDMA capability from its kernel-bound PF.
+	if got := *devices[idx].Attributes[AttrDomain+"/rdmaCapable"].BoolValue; !got {
+		t.Fatal("VF of an RDMA PF must be rdmaCapable")
+	}
 
 	// Whole-PF pool with resourceName default.
 	idx, ok = byName["pci-0000-51-00-0"]
@@ -128,6 +138,10 @@ func TestBuildDevices(t *testing.T) {
 	}
 	if _, hasVfIndex := attrs[AttrDomain+"/vfIndex"]; hasVfIndex {
 		t.Fatal("PF must not carry a vfIndex attribute")
+	}
+	// vfio-bound whole PF exposes no RDMA node; the Mellanox vendor id stands in.
+	if got := *attrs[AttrDomain+"/rdmaCapable"].BoolValue; !got {
+		t.Fatal("Mellanox PF must be rdmaCapable")
 	}
 
 	// The GPU is not advertised.

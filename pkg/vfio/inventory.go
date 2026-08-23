@@ -314,17 +314,41 @@ func (inv *Inventory) buildDevice(spec *Spec, resourceName string) resourceapi.D
 	if numa, err := inv.sysfs.GetNumaNode(spec.PCIAddress); err == nil && numa >= 0 {
 		device.Attributes[AttrDomain+"/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(numa))}
 	}
-	if vendor, err := inv.sysfs.GetVendorID(spec.PCIAddress); err == nil && vendor != "" {
-		device.Attributes[AttrDomain+"/vendor"] = resourceapi.DeviceAttribute{StringValue: ptr.To(vendor)}
+	vendor := ""
+	if v, err := inv.sysfs.GetVendorID(spec.PCIAddress); err == nil && v != "" {
+		vendor = v
+		device.Attributes[AttrDomain+"/vendor"] = resourceapi.DeviceAttribute{StringValue: ptr.To(v)}
 	}
 	if deviceID, err := inv.sysfs.GetDeviceID(spec.PCIAddress); err == nil && deviceID != "" {
 		device.Attributes[AttrDomain+"/deviceID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(deviceID)}
 	}
+	device.Attributes[AttrDomain+"/rdmaCapable"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(inv.isRdmaCapable(spec, vendor))}
 	// Best effort: topology alignment hint, resolved from the live /sys.
 	if pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(spec.PCIAddress); err == nil {
 		device.Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
 	}
 	return device
+}
+
+// mellanoxVendorID is the PCI vendor id of NVIDIA/Mellanox NICs, all of which
+// are RDMA-capable.
+const mellanoxVendorID = "15b3"
+
+// isRdmaCapable reports whether the function belongs to RDMA-capable silicon.
+// The authoritative signal is an RDMA device node on the function or on its PF
+// (a pooled VF is vfio-bound, but its PF keeps the kernel driver); a whole PF
+// handed to vfio-pci exposes no node, so link type and Mellanox vendor id
+// stand in.
+func (inv *Inventory) isRdmaCapable(spec *Spec, vendor string) bool {
+	if ok, err := inv.sysfs.HasInfinibandDevice(spec.PCIAddress); err == nil && ok {
+		return true
+	}
+	if spec.PFPCIAddress != "" {
+		if ok, err := inv.sysfs.HasInfinibandDevice(spec.PFPCIAddress); err == nil && ok {
+			return true
+		}
+	}
+	return spec.LinkType == LinkTypeInfiniband || vendor == mellanoxVendorID
 }
 
 func linkTypeOf(class string) string {

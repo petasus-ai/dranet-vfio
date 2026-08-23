@@ -82,6 +82,12 @@ func (b *sysfsBuilder) vf(vfBdf, pfBdf string, index string) {
 	b.symlink("../"+vfBdf, "bus/pci/devices", pfBdf, "virtfn"+index)
 }
 
+// infiniband gives a device an RDMA device node, as the kernel driver of an
+// RDMA-capable function does.
+func (b *sysfsBuilder) infiniband(bdf, ibdev string) {
+	b.mkdir("bus/pci/devices", bdf, "infiniband", ibdev)
+}
+
 func (b *sysfsBuilder) netdev(pfBdf, name, physPortName string) {
 	b.mkdir("bus/pci/devices", pfBdf, "net", name)
 	if physPortName != "" {

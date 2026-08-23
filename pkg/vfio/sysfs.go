@@ -91,6 +91,7 @@ type SysfsOps interface {
 	GetDriver(devPci string) (string, error)
 	GetVendorID(devPci string) (string, error)
 	GetDeviceID(devPci string) (string, error)
+	HasInfinibandDevice(devPci string) (bool, error)
 	GetIOMMUGroup(devPci string) (int, error)
 	ListIOMMUGroupDevices(group int) ([]string, error)
 	GetNumaNode(devPci string) (int, error)
@@ -259,6 +260,20 @@ func (o *realSysfs) GetVendorID(devPci string) (string, error) {
 // GetDeviceID returns the device's PCI device id without the 0x prefix.
 func (o *realSysfs) GetDeviceID(devPci string) (string, error) {
 	return o.readPciID(devPci, "device")
+}
+
+// HasInfinibandDevice reports whether the device exposes an RDMA device node
+// (/sys/bus/pci/devices/<addr>/infiniband has entries). Only a kernel-bound
+// function exposes one; a vfio-bound function never does.
+func (o *realSysfs) HasInfinibandDevice(devPci string) (bool, error) {
+	entries, err := os.ReadDir(filepath.Join(o.basePath, "bus/pci/devices", devPci, "infiniband"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return len(entries) > 0, nil
 }
 
 func (o *realSysfs) readPciID(devPci, file string) (string, error) {
