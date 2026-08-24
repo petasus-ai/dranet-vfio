@@ -19,6 +19,7 @@ package vfio
 import (
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -631,14 +632,77 @@ func (c *Configurer) resolveUplinkVlan(uplink string, want int) (int, error) {
 			want, uplink, vlanSummary(carried))
 	}
 
-	for _, vi := range carried {
-		if vi.PortVID() && vi.EngressUntag() {
-			klog.V(2).Infof("resolved untagged VLAN %d from uplink %s", vi.Vid, uplink)
-			return int(vi.Vid), nil
-		}
+	if vid, ok := untaggedVid(carried); ok {
+		klog.V(2).Infof("resolved untagged VLAN %d from uplink %s", vid, uplink)
+		return vid, nil
 	}
 	return 0, fmt.Errorf("this network specifies no VLAN, but uplink %s carries no untagged VLAN "+
 		"(carries %s); a network on a trunk uplink must specify a VLAN", uplink, vlanSummary(carried))
+}
+
+// untaggedVid returns the VID a bridge port carries egress-untagged as its
+// PVID — the VID an unspecified-VLAN network resolves to.
+func untaggedVid(vlans []*nl.BridgeVlanInfo) (int, bool) {
+	for _, vi := range vlans {
+		if vi.PortVID() && vi.EngressUntag() {
+			return int(vi.Vid), true
+		}
+	}
+	return 0, false
+}
+
+// compressVlanRanges renders VIDs ascending with contiguous runs collapsed
+// ("1,100-119,4000").
+func compressVlanRanges(vlans []*nl.BridgeVlanInfo) string {
+	vids := make([]int, 0, len(vlans))
+	for _, vi := range vlans {
+		vids = append(vids, int(vi.Vid))
+	}
+	sort.Ints(vids)
+	parts := make([]string, 0, len(vids))
+	for i := 0; i < len(vids); {
+		j := i
+		for j+1 < len(vids) && vids[j+1] == vids[j]+1 {
+			j++
+		}
+		if j == i {
+			parts = append(parts, strconv.Itoa(vids[i]))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d-%d", vids[i], vids[j]))
+		}
+		i = j + 1
+	}
+	return strings.Join(parts, ",")
+}
+
+// maxVlanAttrLen is the DRA cap on a string attribute value
+// (DeviceAttributeMaxValueLength); the uplinkVlans attribute must fit it.
+const maxVlanAttrLen = 64
+
+// formatVlanRanges is compressVlanRanges capped for the uplinkVlans device
+// attribute: on overflow trailing ranges are dropped and truncated is true,
+// telling the consumer the set is incomplete and membership undecidable.
+//
+// Known issue: truncation is purely a size limit — the uplink DOES carry the
+// dropped VLANs; nothing is misconfigured on the node. Consumers must not
+// treat the truncated flag as an error: skip the pre-validation for VIDs not
+// in the published prefix and continue; the prepare path stays the authority.
+//
+// TODO: once the DRAListTypeAttributes feature gate (KEP-5491, alpha in
+// Kubernetes 1.36) is enabled by default, publish uplinkVlans as a
+// StringValues list — one range CSV per 64-char element, the full set the
+// comma-join of the elements — so the set no longer truncates in practice.
+// https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/5491-dra-list-types-for-attributes
+func formatVlanRanges(vlans []*nl.BridgeVlanInfo) (string, bool) {
+	out := compressVlanRanges(vlans)
+	if len(out) <= maxVlanAttrLen {
+		return out, false
+	}
+	cut := strings.LastIndex(out[:maxVlanAttrLen+1], ",")
+	if cut < 0 {
+		return "", true
+	}
+	return out[:cut], true
 }
 
 // vlanSummary renders a bridge port's VLAN membership for error messages, so
@@ -647,15 +711,11 @@ func vlanSummary(vlans []*nl.BridgeVlanInfo) string {
 	if len(vlans) == 0 {
 		return "no VLANs"
 	}
-	parts := make([]string, 0, len(vlans))
-	for _, vi := range vlans {
-		s := strconv.Itoa(int(vi.Vid))
-		if vi.PortVID() && vi.EngressUntag() {
-			s += " untagged"
-		}
-		parts = append(parts, s)
+	s := compressVlanRanges(vlans)
+	if vid, ok := untaggedVid(vlans); ok {
+		s += fmt.Sprintf(" (%d untagged)", vid)
 	}
-	return strings.Join(parts, ", ")
+	return s
 }
 
 // configureBridgeVlan sets up the representor as access port (PVID + untagged).
@@ -846,9 +906,10 @@ func (c *Configurer) removeBridgeVlan(state *HostState) error {
 }
 
 // detectUplink returns the uplink interface name: the PF's bond master
-// when the PF is enslaved to a bond, otherwise the PF itself.
-func (c *Configurer) detectUplink(pfName string) (string, error) {
-	pfLink, err := c.netlink.LinkByName(pfName)
+// when the PF is enslaved to a bond, otherwise the PF itself. Package-level
+// so the inventory resolves the exact same uplink the prepare path uses.
+func detectUplink(nlops NetlinkOps, pfName string) (string, error) {
+	pfLink, err := nlops.LinkByName(pfName)
 	if err != nil {
 		return "", fmt.Errorf("failed to get PF link %s: %w", pfName, err)
 	}
@@ -856,7 +917,7 @@ func (c *Configurer) detectUplink(pfName string) (string, error) {
 	if masterIdx == 0 {
 		return pfName, nil
 	}
-	masterLink, err := c.netlink.LinkByIndex(masterIdx)
+	masterLink, err := nlops.LinkByIndex(masterIdx)
 	if err != nil {
 		return "", fmt.Errorf("failed to get PF master link: %w", err)
 	}
@@ -867,9 +928,13 @@ func (c *Configurer) detectUplink(pfName string) (string, error) {
 	return pfName, nil
 }
 
+func (c *Configurer) detectUplink(pfName string) (string, error) {
+	return detectUplink(c.netlink, pfName)
+}
+
 // detectBridge returns the bridge name for the given uplink.
-func (c *Configurer) detectBridge(uplink string) (string, error) {
-	uplinkLink, err := c.netlink.LinkByName(uplink)
+func detectBridge(nlops NetlinkOps, uplink string) (string, error) {
+	uplinkLink, err := nlops.LinkByName(uplink)
 	if err != nil {
 		return "", fmt.Errorf("failed to get uplink link %s: %w", uplink, err)
 	}
@@ -877,7 +942,7 @@ func (c *Configurer) detectBridge(uplink string) (string, error) {
 	if masterIdx == 0 {
 		return "", fmt.Errorf("uplink %s has no bridge master (has provisioning run?)", uplink)
 	}
-	masterLink, err := c.netlink.LinkByIndex(masterIdx)
+	masterLink, err := nlops.LinkByIndex(masterIdx)
 	if err != nil {
 		return "", fmt.Errorf("failed to get uplink master link: %w", err)
 	}
@@ -886,6 +951,10 @@ func (c *Configurer) detectBridge(uplink string) (string, error) {
 			uplink, masterLink.Attrs().Name, masterLink.Type())
 	}
 	return masterLink.Attrs().Name, nil
+}
+
+func (c *Configurer) detectBridge(uplink string) (string, error) {
+	return detectBridge(c.netlink, uplink)
 }
 
 // getEswitchMode queries devlink for the PF's eswitch mode.

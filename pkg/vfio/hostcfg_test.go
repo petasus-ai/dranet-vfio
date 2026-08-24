@@ -483,3 +483,45 @@ func TestValidateIOMMUGroup(t *testing.T) {
 		t.Fatalf("expected non-viable group error, got %v", err)
 	}
 }
+
+func TestFormatVlanRanges(t *testing.T) {
+	vlans := []*nl.BridgeVlanInfo{
+		{Vid: 5},
+		{Vid: 1, Flags: nl.BRIDGE_VLAN_INFO_PVID | nl.BRIDGE_VLAN_INFO_UNTAGGED},
+		{Vid: 3}, {Vid: 2}, {Vid: 100},
+	}
+	out, truncated := formatVlanRanges(vlans)
+	if out != "1-3,5,100" || truncated {
+		t.Fatalf("unexpected ranges %q truncated=%v", out, truncated)
+	}
+	if out, truncated = formatVlanRanges(nil); out != "" || truncated {
+		t.Fatalf("unexpected empty-set result %q truncated=%v", out, truncated)
+	}
+
+	// 50 non-contiguous VIDs cannot fit 64 chars: truncated at a range boundary.
+	long := []*nl.BridgeVlanInfo{}
+	for vid := 101; vid < 200; vid += 2 {
+		long = append(long, &nl.BridgeVlanInfo{Vid: uint16(vid)})
+	}
+	out, truncated = formatVlanRanges(long)
+	if !truncated {
+		t.Fatalf("expected truncation, got %q", out)
+	}
+	if len(out) > maxVlanAttrLen || strings.HasSuffix(out, ",") || out == "" {
+		t.Fatalf("malformed truncated ranges %q", out)
+	}
+
+	if vid, ok := untaggedVid(vlans); !ok || vid != 1 {
+		t.Fatalf("unexpected untagged VID %d ok=%v", vid, ok)
+	}
+	if _, ok := untaggedVid(long); ok {
+		t.Fatal("pure trunk must have no untagged VID")
+	}
+
+	if got := vlanSummary(vlans); got != "1-3,5,100 (1 untagged)" {
+		t.Fatalf("unexpected summary %q", got)
+	}
+	if got := vlanSummary(nil); got != "no VLANs" {
+		t.Fatalf("unexpected empty summary %q", got)
+	}
+}

@@ -19,6 +19,8 @@ package vfio
 import (
 	"testing"
 
+	"github.com/vishvananda/netlink/nl"
+
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
 )
@@ -198,6 +200,86 @@ func TestBuildDevicesByPFPciAddress(t *testing.T) {
 	if len(devices) != 0 {
 		t.Fatalf("expected no devices on an unlisted node, got %v", deviceNames(devices))
 	}
+}
+
+// TestBuildDevicesUplinkVlans: ethernet VFs publish their PF uplink's VLAN
+// snapshot; InfiniBand and whole-PF devices publish none.
+func TestBuildDevicesUplinkVlans(t *testing.T) {
+	b := inventoryFixture(t)
+	b.writeFile("1", "class/net/br0/bridge/vlan_filtering")
+
+	nlops := newFakeNetlink()
+	nlops.addLink("enp8s0f0np0", "device", 1, 2, 1500)
+	nlops.addLink("bond0", "bond", 2, 3, 1500)
+	nlops.addLink("br0", "bridge", 3, 0, 1500)
+	nlops.vlanTable[2] = []*nl.BridgeVlanInfo{
+		{Vid: 1, Flags: nl.BRIDGE_VLAN_INFO_PVID | nl.BRIDGE_VLAN_INFO_UNTAGGED},
+		{Vid: 102}, {Vid: 100}, {Vid: 101}, {Vid: 200},
+	}
+
+	inv := New(writeConfig(t, inventoryConfig), "node-1", WithSysfs(b.ops()), WithNetlink(nlops))
+	devices, _ := inv.buildDevices()
+
+	byName := map[string]resourceapi.Device{}
+	for _, dev := range devices {
+		byName[dev.Name] = dev
+	}
+
+	for _, name := range []string{"pci-0000-08-00-2", "pci-0000-08-00-3"} {
+		attrs := byName[name].Attributes
+		if got := *attrs[AttrDomain+"/uplink"].StringValue; got != "bond0" {
+			t.Fatalf("%s: unexpected uplink %q", name, got)
+		}
+		if got := *attrs[AttrDomain+"/bridge"].StringValue; got != "br0" {
+			t.Fatalf("%s: unexpected bridge %q", name, got)
+		}
+		if got := *attrs[AttrDomain+"/vlanFiltering"].BoolValue; !got {
+			t.Fatalf("%s: expected vlanFiltering true", name)
+		}
+		if got := *attrs[AttrDomain+"/uplinkVlans"].StringValue; got != "1,100-102,200" {
+			t.Fatalf("%s: unexpected uplinkVlans %q", name, got)
+		}
+		if got := *attrs[AttrDomain+"/untaggedVlan"].IntValue; got != 1 {
+			t.Fatalf("%s: unexpected untaggedVlan %d", name, got)
+		}
+		if _, ok := attrs[AttrDomain+"/uplinkVlansTruncated"]; ok {
+			t.Fatalf("%s: unexpected uplinkVlansTruncated", name)
+		}
+	}
+
+	for _, name := range []string{"pci-0000-0c-00-2", "pci-0000-51-00-0"} {
+		if _, ok := byName[name].Attributes[AttrDomain+"/uplink"]; ok {
+			t.Fatalf("%s: must not carry uplink attributes", name)
+		}
+	}
+}
+
+// A PF that is its own uplink with no bridge master publishes the uplink
+// name only — no bridge, filtering, or VLAN attributes.
+func TestBuildDevicesUplinkNoBridge(t *testing.T) {
+	b := inventoryFixture(t)
+
+	nlops := newFakeNetlink()
+	nlops.addLink("enp8s0f0np0", "device", 1, 0, 1500)
+
+	inv := New(writeConfig(t, inventoryConfig), "node-1", WithSysfs(b.ops()), WithNetlink(nlops))
+	devices, _ := inv.buildDevices()
+
+	for _, dev := range devices {
+		if dev.Name != "pci-0000-08-00-2" {
+			continue
+		}
+		if got := *dev.Attributes[AttrDomain+"/uplink"].StringValue; got != "enp8s0f0np0" {
+			t.Fatalf("unexpected uplink %q", got)
+		}
+		for _, attr := range []string{"bridge", "vlanFiltering", "uplinkVlans", "untaggedVlan"} {
+			if _, ok := dev.Attributes[resourceapi.QualifiedName(AttrDomain+"/"+attr)]; ok {
+				t.Fatalf("unexpected attribute %s without a bridge", attr)
+			}
+		}
+		return
+	}
+	t.Fatalf("VF device missing: %v", deviceNames(devices))
 }
 
 func deviceNames(devices []resourceapi.Device) []string {

@@ -28,6 +28,8 @@ import (
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/names"
 
+	"github.com/vishvananda/netlink/nl"
+
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
@@ -72,6 +74,7 @@ type Inventory struct {
 	nodeName       string
 	reloadInterval time.Duration
 	sysfs          SysfsOps
+	netlink        NetlinkOps
 
 	mu        sync.RWMutex
 	devices   map[string]resourceapi.Device
@@ -99,6 +102,13 @@ func WithSysfs(s SysfsOps) Option {
 	}
 }
 
+// WithNetlink overrides the netlink implementation (for testing).
+func WithNetlink(n NetlinkOps) Option {
+	return func(inv *Inventory) {
+		inv.netlink = n
+	}
+}
+
 // New creates an Inventory that discovers vfio-pci-bound network devices
 // and advertises those matched by a pool defined in configPath.
 func New(configPath, nodeName string, opts ...Option) *Inventory {
@@ -107,6 +117,7 @@ func New(configPath, nodeName string, opts ...Option) *Inventory {
 		nodeName:       nodeName,
 		reloadInterval: defaultReloadInterval,
 		sysfs:          NewSysfs(),
+		netlink:        NewNetlink(),
 		devices:        map[string]resourceapi.Device{},
 		specs:          map[string]Spec{},
 		notifications:  make(chan []resourceapi.Device, 1),
@@ -182,6 +193,10 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 		return devices, specs
 	}
 
+	// Per-pass memo: many VFs share one parent PF, and one bridge VLAN dump
+	// serves every PF.
+	uplinks := uplinkResolver{netlink: inv.netlink, sysfs: inv.sysfs, states: map[string]*uplinkState{}}
+
 	for _, bdf := range bdfs {
 		spec, err := inv.describeDevice(bdf)
 		if err != nil {
@@ -207,12 +222,92 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 			resourceName = DefaultResourceNamePrefix + pool.Name
 		}
 
-		device := inv.buildDevice(spec, resourceName)
+		// Uplink VLAN state applies only where the VLAN prepare path does:
+		// an ethernet VF whose PF keeps a kernel netdev.
+		var up *uplinkState
+		if spec.Kind == KindVF && spec.LinkType == LinkTypeEthernet && spec.PFName != "" {
+			up = uplinks.stateFor(spec.PFName)
+		}
+
+		device := inv.buildDevice(spec, resourceName, up)
 		devices = append(devices, device)
 		specs[device.Name] = *spec
 	}
 	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
 	return devices, specs
+}
+
+// uplinkState is one PF's uplink snapshot, published as device attributes so
+// the management platform can validate a requested VLAN at network create.
+// Empty/false "has" fields mean the step could not be resolved and nothing is
+// published for it — a consumer must treat absence as unknown, not as "not
+// carried"; the prepare path stays the authority.
+type uplinkState struct {
+	uplink       string
+	bridge       string
+	filtering    bool
+	hasFiltering bool
+	vlans        []*nl.BridgeVlanInfo
+	hasVlans     bool
+}
+
+// uplinkResolver memoizes uplinkState per PF within one sync pass and fetches
+// the bridge VLAN dump at most once per pass.
+type uplinkResolver struct {
+	netlink        NetlinkOps
+	sysfs          SysfsOps
+	states         map[string]*uplinkState
+	vlanMap        map[int32][]*nl.BridgeVlanInfo
+	vlanMapFetched bool
+}
+
+func (r *uplinkResolver) stateFor(pfName string) *uplinkState {
+	if st, ok := r.states[pfName]; ok {
+		return st
+	}
+	st := &uplinkState{}
+	r.states[pfName] = st
+	uplink, err := detectUplink(r.netlink, pfName)
+	if err != nil {
+		klog.V(4).Infof("vfio inventory: no uplink for PF %s: %v", pfName, err)
+		return st
+	}
+	st.uplink = uplink
+	bridge, err := detectBridge(r.netlink, uplink)
+	if err != nil {
+		klog.V(4).Infof("vfio inventory: no bridge for uplink %s: %v", uplink, err)
+		return st
+	}
+	st.bridge = bridge
+	filtering, err := r.sysfs.GetBridgeVlanFiltering(bridge)
+	if err != nil {
+		klog.V(4).Infof("vfio inventory: bridge %s vlan_filtering unreadable: %v", bridge, err)
+		return st
+	}
+	st.filtering, st.hasFiltering = filtering, true
+	if !filtering {
+		// Without filtering the bridge has no VLAN membership to publish.
+		return st
+	}
+	if !r.vlanMapFetched {
+		r.vlanMapFetched = true
+		if m, err := r.netlink.BridgeVlanList(); err != nil {
+			klog.Warningf("vfio inventory: bridge VLAN dump failed: %v", err)
+		} else {
+			r.vlanMap = m
+		}
+	}
+	if r.vlanMap == nil {
+		return st
+	}
+	link, err := r.netlink.LinkByName(uplink)
+	if err != nil {
+		return st
+	}
+	// An empty carried set is still definitive: the uplink carries nothing.
+	st.vlans = r.vlanMap[int32(link.Attrs().Index)] //nolint:gosec // ifindex is int32 in the kernel ABI
+	st.hasVlans = true
+	return st
 }
 
 // describeDevice reads the sysfs facts of one vfio-pci-bound function.
@@ -285,7 +380,7 @@ func (inv *Inventory) matchPool(config *Config, spec *Spec) *PoolConfig {
 	return matched
 }
 
-func (inv *Inventory) buildDevice(spec *Spec, resourceName string) resourceapi.Device {
+func (inv *Inventory) buildDevice(spec *Spec, resourceName string, up *uplinkState) resourceapi.Device {
 	device := resourceapi.Device{
 		Name: names.NormalizePCIAddress(spec.PCIAddress),
 		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
@@ -326,6 +421,35 @@ func (inv *Inventory) buildDevice(spec *Spec, resourceName string) resourceapi.D
 	// Best effort: topology alignment hint, resolved from the live /sys.
 	if pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(spec.PCIAddress); err == nil {
 		device.Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
+	}
+	if up != nil {
+		if up.uplink != "" {
+			device.Attributes[AttrDomain+"/uplink"] = resourceapi.DeviceAttribute{StringValue: ptr.To(up.uplink)}
+		}
+		if up.bridge != "" {
+			device.Attributes[AttrDomain+"/bridge"] = resourceapi.DeviceAttribute{StringValue: ptr.To(up.bridge)}
+		}
+		if up.hasFiltering {
+			device.Attributes[AttrDomain+"/vlanFiltering"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(up.filtering)}
+		}
+		if up.hasVlans {
+			ranges, truncated := formatVlanRanges(up.vlans)
+			device.Attributes[AttrDomain+"/uplinkVlans"] = resourceapi.DeviceAttribute{StringValue: ptr.To(ranges)}
+			if truncated {
+				// Known issue, not a node fault: the carried set overflowed
+				// the 64-char DRA string value, so the published prefix is
+				// incomplete — the dropped VLANs ARE carried by the uplink.
+				// Consumers must not fail on this flag; treat membership of
+				// unlisted VIDs as unknown and continue, leaving enforcement
+				// to NodePrepareResources. Goes away once uplinkVlans can be
+				// a KEP-5491 list attribute (DRAListTypeAttributes on by
+				// default) — see formatVlanRanges.
+				device.Attributes[AttrDomain+"/uplinkVlansTruncated"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(true)}
+			}
+			if vid, ok := untaggedVid(up.vlans); ok {
+				device.Attributes[AttrDomain+"/untaggedVlan"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(vid))}
+			}
+		}
 	}
 	return device
 }
