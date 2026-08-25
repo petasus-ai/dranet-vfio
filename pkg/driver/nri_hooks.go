@@ -255,8 +255,16 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 
 		resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
 	}
-	// do not block the handler to update the status
+	// KEP-5007 device-binding conditions (status.devices Ready/RDMALinkReady) are not
+	// written where resourceclaims/status routes allocation/reservedFor through the
+	// immutable resourceclaims/binding subresource (K8s v1.36): the apply is rejected on
+	// every prepare and only produces error-log noise while the prepare itself already
+	// succeeded. Skip the write; flip skipStatusWrite to re-enable when supported.
+	const skipStatusWrite = true
 	for claim, status := range statusUpdates {
+		if skipStatusWrite {
+			break
+		}
 		resourceClaimApply := resourceapply.ResourceClaim(claim.Name, claim.Namespace).WithStatus(status)
 		claimLogger := klog.LoggerWithValues(logger, "claim", klog.KRef(claim.Namespace, claim.Name))
 		go func() {

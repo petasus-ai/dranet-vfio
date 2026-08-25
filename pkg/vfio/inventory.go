@@ -48,6 +48,10 @@ const (
 	// DefaultResourceNamePrefix prefixes pool names into resource names.
 	DefaultResourceNamePrefix = "petasus.io/"
 
+	// DefaultPoolName is the pool every otherwise-unmatched vfio-pci function is
+	// auto-published under: a vfio-pci binding already means passthrough intent.
+	DefaultPoolName = "vfio"
+
 	defaultReloadInterval = 30 * time.Second
 )
 
@@ -210,16 +214,20 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 		}
 
 		pool := inv.matchPool(config, spec)
-		if pool == nil {
-			klog.V(4).Infof("vfio inventory: device %s (%s %s, PF %s) matches no pool, not advertising",
-				bdf, spec.LinkType, spec.Kind, spec.PFName)
-			continue
-		}
-		spec.Pool = pool.Name
-
-		resourceName := pool.ResourceName
-		if resourceName == "" {
-			resourceName = DefaultResourceNamePrefix + pool.Name
+		var resourceName string
+		if pool != nil {
+			spec.Pool = pool.Name
+			resourceName = pool.ResourceName
+			if resourceName == "" {
+				resourceName = DefaultResourceNamePrefix + pool.Name
+			}
+		} else {
+			// A vfio-pci binding already means passthrough intent, so auto-publish every
+			// otherwise-unmatched vfio-pci function under the default pool. The management
+			// platform lists these and may later define a named pool selecting a subset
+			// (which then wins over this default via matchPool above).
+			spec.Pool = DefaultPoolName
+			resourceName = DefaultResourceNamePrefix + DefaultPoolName
 		}
 
 		// Uplink VLAN state applies only where the VLAN prepare path does:
