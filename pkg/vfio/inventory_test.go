@@ -189,8 +189,14 @@ func TestBuildDevicesUplinkVlans(t *testing.T) {
 		if got := *attrs[AttrDomain+"/untaggedVlan"].IntValue; got != 1 {
 			t.Fatalf("%s: unexpected untaggedVlan %d", name, got)
 		}
+		if got := *attrs[AttrDomain+"/uplinkVlansExact"].StringValue; got != ",1,100,101,102,200," {
+			t.Fatalf("%s: unexpected uplinkVlansExact %q", name, got)
+		}
 		if _, ok := attrs[AttrDomain+"/uplinkVlansTruncated"]; ok {
 			t.Fatalf("%s: unexpected uplinkVlansTruncated", name)
+		}
+		if _, ok := attrs[AttrDomain+"/uplinkVlansExactOverflow"]; ok {
+			t.Fatalf("%s: unexpected uplinkVlansExactOverflow", name)
 		}
 	}
 

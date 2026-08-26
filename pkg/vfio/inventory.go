@@ -406,6 +406,15 @@ func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Devic
 				// default) — see formatVlanRanges.
 				device.Attributes[AttrDomain+"/uplinkVlansTruncated"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(true)}
 			}
+			// Exact comma-padded enumeration for CEL membership tests
+			// (DeviceClass selection by carried VID); the overflow escape
+			// keeps selection permissive and leaves enforcement to
+			// NodePrepareResources.
+			if exact, ok := formatVlanExact(up.vlans); ok {
+				device.Attributes[AttrDomain+"/uplinkVlansExact"] = resourceapi.DeviceAttribute{StringValue: ptr.To(exact)}
+			} else {
+				device.Attributes[AttrDomain+"/uplinkVlansExactOverflow"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(true)}
+			}
 			if vid, ok := untaggedVid(up.vlans); ok {
 				device.Attributes[AttrDomain+"/untaggedVlan"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(vid))}
 			}

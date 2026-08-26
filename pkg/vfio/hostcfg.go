@@ -705,6 +705,31 @@ func formatVlanRanges(vlans []*nl.BridgeVlanInfo) (string, bool) {
 	return out[:cut], true
 }
 
+// formatVlanExact renders the full VID set as a comma-padded enumeration
+// (",1,100,101,") for exact CEL membership tests
+// (uplinkVlansExact.contains(",<vid>,")). ok is false when the enumeration
+// does not fit the attribute cap — the device then publishes the
+// uplinkVlansExactOverflow escape instead, consumers stay permissive and the
+// prepare path remains the authority.
+func formatVlanExact(vlans []*nl.BridgeVlanInfo) (string, bool) {
+	vids := make([]int, 0, len(vlans))
+	for _, vi := range vlans {
+		vids = append(vids, int(vi.Vid))
+	}
+	sort.Ints(vids)
+	var b strings.Builder
+	b.WriteString(",")
+	for _, vid := range vids {
+		b.WriteString(strconv.Itoa(vid))
+		b.WriteString(",")
+	}
+	out := b.String()
+	if len(out) > maxVlanAttrLen {
+		return "", false
+	}
+	return out, true
+}
+
 // vlanSummary renders a bridge port's VLAN membership for error messages, so
 // an operator sees what the uplink offers without going to the node.
 func vlanSummary(vlans []*nl.BridgeVlanInfo) string {
