@@ -1,35 +1,12 @@
-# Example pool configuration and DeviceClass for a lab node with a
-# ConnectX-6 Lx: Ethernet VFs on the 25G PF plus a whole-PF passthrough.
+# Example DeviceClasses for a lab node with a ConnectX-6 Lx. The driver
+# publishes every vfio-pci-bound network function with hardware-fact
+# attributes; selection policy lives entirely in DeviceClass CEL. Every
+# attribute read is guarded with `"attr" in ...` — reading an absent CEL
+# attribute aborts the whole allocation.
 #
-# The ConfigMap is installation-owned (authored at provisioning time); the
-# management platform reads it for pool validation but never writes it.
-# DeviceClass naming follows the management platform's convention: the
-# resource name "petasus.io/<pool>" becomes DeviceClass "<pool>.petasus.io".
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: dranet-vfio-config
-  namespace: dra-system
-data:
-  config.yaml: |
-    pools:
-      # VFs selected by the parent PF's PCI address (stable across netdev
-      # renames; the usual provisioning-time selector).
-      - name: vf-25
-        pfPciAddressesByNode:
-          bundang-10f-33: ["0000:86:00.1"]
-          bundang-10f-35: ["0001:01:00.1"]
-      # VFs selected by the parent PF's netdev name.
-      - name: vf-lag-trunk
-        pfNamesByNode:
-          bundang-10f-35: [enp1s0f1np1]
-      - name: ib-compute
-        linkType: infiniband
-        pfNames: [ibp12s0]
-      - name: dpdk-uplink
-        kind: pf
-        pciAddresses: ["0000:51:00.1"]
----
+# VFs selected by their parent PF's PCI address (stable across netdev
+# renames; the per-node PCI difference is expressed as a cross-node union —
+# allocation is per-node, so the union is safe).
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
 metadata:
@@ -39,5 +16,41 @@ spec:
     - cel:
         expression: >-
           device.driver == "vfio.petasus.io" &&
-          "resourceName" in device.attributes["k8s.cni.cncf.io"] &&
-          device.attributes["k8s.cni.cncf.io"].resourceName == "petasus.io/vf-25"
+          "kind" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].kind == "vf" &&
+          "linkType" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].linkType == "ethernet" &&
+          "pfPciAddress" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].pfPciAddress in ["0000:86:00.1", "0001:01:00.1"]
+---
+# InfiniBand VFs, selected by link type and parent PF netdev name.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: ib-compute.petasus.io
+spec:
+  selectors:
+    - cel:
+        expression: >-
+          device.driver == "vfio.petasus.io" &&
+          "kind" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].kind == "vf" &&
+          "linkType" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].linkType == "infiniband" &&
+          "pfName" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].pfName == "ibp12s0"
+---
+# Whole-PF passthrough, selected by the function's own PCI address.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dpdk-uplink.petasus.io
+spec:
+  selectors:
+    - cel:
+        expression: >-
+          device.driver == "vfio.petasus.io" &&
+          "kind" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].kind == "pf" &&
+          "pciBusID" in device.attributes["resource.kubernetes.io"] &&
+          device.attributes["resource.kubernetes.io"].pciBusID == "0000:51:00.1"

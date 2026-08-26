@@ -10,31 +10,17 @@ Driver name: `vfio.petasus.io`.
 ## How it works
 
 - Hardware is discovered from sysfs: every PCI function bound to `vfio-pci`
-  whose class is a network controller (`0x02xx`/`0x0c06xx`). Which devices
-  are exposed — and under which pool — is defined in a ConfigMap-backed
-  config file (`--config`, default `/etc/dranet-vfio/config.yaml`):
-
-  ```yaml
-  pools:
-    - name: vf-25                    # Ethernet VFs by parent PF netdev
-      pfNames: [enp8s0f0np0]
-      pfNamesByNode:
-        bundang-10f-33: [ens2f0np0]  # per-node override
-    - name: ib-compute               # InfiniBand VFs (pure passthrough)
-      linkType: infiniband
-      pfNames: [ibp12s0]
-    - name: dpdk-uplink              # whole-PF passthrough by PCI address
-      kind: pf
-      pciAddresses: ["0000:51:00.1"]
-  ```
+  whose class is a network controller (`0x02xx`/`0x0c06xx`) is published —
+  a vfio-pci binding already means passthrough intent. There is no driver
+  configuration; selection policy lives entirely in DeviceClass CEL over the
+  published attributes.
 
   Each device is published as a ResourceSlice device `pci-<bdf>` with the
-  attributes `k8s.cni.cncf.io/resourceName` (default `petasus.io/<pool>`),
-  the standard `resource.kubernetes.io/pciBusID`, and
-  `vfio.petasus.io/{pool,kind,linkType,vendor,deviceID,pfName,pfPciAddress,vfIndex,iommuGroup,pciClass,numaNode,deviceType}`.
-  The file is re-read periodically (`--config-reload-interval`), which also
-  rescans the hardware, so pool edits and newly bound devices need no driver
-  restart.
+  standard `resource.kubernetes.io/pciBusID` attribute and
+  `vfio.petasus.io/{kind,linkType,vendor,deviceID,pfName,pfPciAddress,vfIndex,iommuGroup,pciClass,numaNode,deviceType,rdmaCapable}`
+  (plus the uplink VLAN snapshot on Ethernet VFs whose PF keeps a netdev).
+  The host is rescanned periodically (`--rescan-interval`), so newly bound
+  devices need no driver restart.
 
 - On `NodePrepareResources` the driver validates the device (vfio-pci
   binding, network PCI class, IOMMU-group viability) and applies the claim's
@@ -82,7 +68,7 @@ annotation.
 
 ```sh
 kubectl apply -f deployments/dranet-vfio.yaml
-kubectl apply -f deployments/examples/bundang-10f-sriov.yaml   # pools + DeviceClass
+kubectl apply -f deployments/examples/bundang-10f-sriov.yaml   # example DeviceClasses
 ```
 
 The upstream dranet documentation below describes the inherited machinery.

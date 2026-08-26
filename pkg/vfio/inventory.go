@@ -41,23 +41,22 @@ const (
 	// AttrDomain is the attribute domain of this driver's device attributes.
 	AttrDomain = "vfio.petasus.io"
 
-	// AttrResourceName carries the pool's logical resource name; the
-	// management platform joins DeviceClasses and networks on it.
-	AttrResourceName = "k8s.cni.cncf.io/resourceName"
+	// KindVF and KindPF classify a function as an SR-IOV VF or a whole PF.
+	KindVF = "vf"
+	KindPF = "pf"
 
-	// DefaultResourceNamePrefix prefixes pool names into resource names.
-	DefaultResourceNamePrefix = "petasus.io/"
+	// LinkTypeEthernet, LinkTypeInfiniband and LinkTypeOther classify a
+	// device by PCI class: 0x0200* is Ethernet, 0x0207*/0x0c06* is
+	// InfiniBand, every other network class is "other".
+	LinkTypeEthernet   = "ethernet"
+	LinkTypeInfiniband = "infiniband"
+	LinkTypeOther      = "other"
 
-	// DefaultPoolName is the pool every otherwise-unmatched vfio-pci function is
-	// auto-published under: a vfio-pci binding already means passthrough intent.
-	DefaultPoolName = "vfio"
-
-	defaultReloadInterval = 30 * time.Second
+	defaultRescanInterval = 30 * time.Second
 )
 
 // Spec describes one published device for the prepare path.
 type Spec struct {
-	Pool         string
 	PCIAddress   string
 	PFPCIAddress string
 	PFName       string
@@ -68,15 +67,14 @@ type Spec struct {
 	IOMMUGroup   int
 }
 
-// Inventory publishes vfio-pci-bound network PCI functions as DRA devices.
-// Hardware is discovered from sysfs; which devices are exposed — and under
-// which pool/resource name — is defined in a config file (mounted from a
-// ConfigMap) that is re-read periodically, so pool changes and newly bound
-// devices propagate without a driver restart.
+// Inventory publishes every vfio-pci-bound network PCI function as a DRA
+// device carrying hardware-fact attributes only; selection policy lives in
+// DeviceClass CEL on the management side. Hardware is discovered from sysfs
+// and rescanned periodically, so newly bound devices propagate without a
+// driver restart.
 type Inventory struct {
-	configPath     string
 	nodeName       string
-	reloadInterval time.Duration
+	rescanInterval time.Duration
 	sysfs          SysfsOps
 	netlink        NetlinkOps
 
@@ -92,10 +90,10 @@ type Inventory struct {
 // Option customizes the Inventory.
 type Option func(*Inventory)
 
-// WithReloadInterval overrides how often the config file is re-read.
-func WithReloadInterval(d time.Duration) Option {
+// WithRescanInterval overrides how often the hardware is rescanned.
+func WithRescanInterval(d time.Duration) Option {
 	return func(inv *Inventory) {
-		inv.reloadInterval = d
+		inv.rescanInterval = d
 	}
 }
 
@@ -113,13 +111,12 @@ func WithNetlink(n NetlinkOps) Option {
 	}
 }
 
-// New creates an Inventory that discovers vfio-pci-bound network devices
-// and advertises those matched by a pool defined in configPath.
-func New(configPath, nodeName string, opts ...Option) *Inventory {
+// New creates an Inventory that discovers and advertises vfio-pci-bound
+// network devices.
+func New(nodeName string, opts ...Option) *Inventory {
 	inv := &Inventory{
-		configPath:     configPath,
 		nodeName:       nodeName,
-		reloadInterval: defaultReloadInterval,
+		rescanInterval: defaultRescanInterval,
 		sysfs:          NewSysfs(),
 		netlink:        NewNetlink(),
 		devices:        map[string]resourceapi.Device{},
@@ -133,13 +130,12 @@ func New(configPath, nodeName string, opts ...Option) *Inventory {
 	return inv
 }
 
-// Run keeps the published device list in sync with the config file and the
-// host's vfio-pci bindings until the context is cancelled. The periodic
-// reload doubles as a hardware rescan, so newly bound devices appear
-// without a restart.
+// Run keeps the published device list in sync with the host's vfio-pci
+// bindings until the context is cancelled: the periodic rescan makes newly
+// bound devices appear without a restart.
 func (inv *Inventory) Run(ctx context.Context) error {
 	inv.sync(true)
-	ticker := time.NewTicker(inv.reloadInterval)
+	ticker := time.NewTicker(inv.rescanInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -153,9 +149,9 @@ func (inv *Inventory) Run(ctx context.Context) error {
 	}
 }
 
-// sync reloads the config, rebuilds the device list and notifies the
-// publisher when the list changed (or unconditionally on the first pass, so
-// an empty device set still results in an initial publish).
+// sync rebuilds the device list and notifies the publisher when the list
+// changed (or unconditionally on the first pass, so an empty device set
+// still results in an initial publish).
 func (inv *Inventory) sync(force bool) {
 	devices, specs := inv.buildDevices()
 
@@ -185,12 +181,6 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 	devices := []resourceapi.Device{}
 	specs := map[string]Spec{}
 
-	config, err := LoadConfig(inv.configPath)
-	if err != nil {
-		klog.Errorf("vfio inventory: failed to load config %s, advertising nothing: %v", inv.configPath, err)
-		return devices, specs
-	}
-
 	bdfs, err := inv.sysfs.ListVFIODevices()
 	if err != nil {
 		klog.Errorf("vfio inventory: failed to list vfio-pci devices, advertising nothing: %v", err)
@@ -213,23 +203,6 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 			continue
 		}
 
-		pool := inv.matchPool(config, spec)
-		var resourceName string
-		if pool != nil {
-			spec.Pool = pool.Name
-			resourceName = pool.ResourceName
-			if resourceName == "" {
-				resourceName = DefaultResourceNamePrefix + pool.Name
-			}
-		} else {
-			// A vfio-pci binding already means passthrough intent, so auto-publish every
-			// otherwise-unmatched vfio-pci function under the default pool. The management
-			// platform lists these and may later define a named pool selecting a subset
-			// (which then wins over this default via matchPool above).
-			spec.Pool = DefaultPoolName
-			resourceName = DefaultResourceNamePrefix + DefaultPoolName
-		}
-
 		// Uplink VLAN state applies only where the VLAN prepare path does:
 		// an ethernet VF whose PF keeps a kernel netdev.
 		var up *uplinkState
@@ -237,7 +210,7 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 			up = uplinks.stateFor(spec.PFName)
 		}
 
-		device := inv.buildDevice(spec, resourceName, up)
+		device := inv.buildDevice(spec, up)
 		devices = append(devices, device)
 		specs[device.Name] = *spec
 	}
@@ -369,35 +342,14 @@ func (inv *Inventory) describeDevice(bdf string) (*Spec, error) {
 	return spec, nil
 }
 
-// matchPool returns the first pool a device belongs to, warning when the
-// configuration makes several pools claim the same device.
-func (inv *Inventory) matchPool(config *Config, spec *Spec) *PoolConfig {
-	var matched *PoolConfig
-	for i := range config.Pools {
-		pool := &config.Pools[i]
-		if !pool.Matches(inv.nodeName, spec.Kind, spec.LinkType, spec.PFName, spec.PFPCIAddress, spec.PCIAddress) {
-			continue
-		}
-		if matched == nil {
-			matched = pool
-			continue
-		}
-		klog.Warningf("vfio inventory: device %s matches pools %q and %q, keeping %q",
-			spec.PCIAddress, matched.Name, pool.Name, matched.Name)
-	}
-	return matched
-}
-
-func (inv *Inventory) buildDevice(spec *Spec, resourceName string, up *uplinkState) resourceapi.Device {
+func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Device {
 	device := resourceapi.Device{
 		Name: names.NormalizePCIAddress(spec.PCIAddress),
 		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-			AttrResourceName: {StringValue: ptr.To(resourceName)},
 			// The standard PCI address attribute is what KubeVirt's DRA
 			// hostdevice path reads (via the KEP-5304 metadata file) to
 			// build the libvirt <hostdev>.
 			deviceattribute.StandardDeviceAttributePCIBusID: {StringValue: ptr.To(spec.PCIAddress)},
-			AttrDomain + "/pool":                            {StringValue: ptr.To(spec.Pool)},
 			AttrDomain + "/kind":                            {StringValue: ptr.To(spec.Kind)},
 			AttrDomain + "/linkType":                        {StringValue: ptr.To(spec.LinkType)},
 			AttrDomain + "/pciClass":                        {StringValue: ptr.To(spec.Class)},
@@ -538,7 +490,7 @@ func (inv *Inventory) GetDeviceConfig(_ string) (*apis.NetworkConfig, bool) {
 	return nil, false
 }
 
-// RequestRescan triggers an immediate config reload and republish check.
+// RequestRescan triggers an immediate hardware rescan and republish check.
 func (inv *Inventory) RequestRescan() {
 	select {
 	case inv.rescan <- struct{}{}:

@@ -57,21 +57,9 @@ func inventoryFixture(t *testing.T) *sysfsBuilder {
 	return b
 }
 
-const inventoryConfig = `
-pools:
-  - name: sriov-a
-    pfNames: [enp8s0f0np0]
-  - name: ib-compute
-    linkType: infiniband
-    pfNames: [ibp12s0]
-  - name: dpdk-pf
-    kind: pf
-    pciAddresses: ["0000:51:00.*"]
-`
-
 func TestBuildDevices(t *testing.T) {
 	b := inventoryFixture(t)
-	inv := New(writeConfig(t, inventoryConfig), "node-1", WithSysfs(b.ops()))
+	inv := New("node-1", WithSysfs(b.ops()))
 
 	devices, specs := inv.buildDevices()
 	if len(devices) != 4 {
@@ -89,9 +77,6 @@ func TestBuildDevices(t *testing.T) {
 		t.Fatalf("VF device missing: %v", deviceNames(devices))
 	}
 	attrs := devices[idx].Attributes
-	if got := *attrs[AttrResourceName].StringValue; got != "petasus.io/sriov-a" {
-		t.Fatalf("unexpected resourceName: %q", got)
-	}
 	if got := *attrs[deviceattribute.StandardDeviceAttributePCIBusID].StringValue; got != "0000:08:00.2" {
 		t.Fatalf("unexpected pciBusID: %q", got)
 	}
@@ -104,6 +89,9 @@ func TestBuildDevices(t *testing.T) {
 	if got := *attrs[AttrDomain+"/pfName"].StringValue; got != "enp8s0f0np0" {
 		t.Fatalf("unexpected pfName: %q", got)
 	}
+	if got := *attrs[AttrDomain+"/pfPciAddress"].StringValue; got != "0000:08:00.0" {
+		t.Fatalf("unexpected pfPciAddress: %q", got)
+	}
 	if got := *attrs[AttrDomain+"/iommuGroup"].IntValue; got != 42 {
 		t.Fatalf("unexpected iommuGroup: %d", got)
 	}
@@ -112,24 +100,24 @@ func TestBuildDevices(t *testing.T) {
 		t.Fatal("plain Ethernet VF must not be rdmaCapable")
 	}
 	spec := specs["pci-0000-08-00-2"]
-	if spec.Pool != "sriov-a" || spec.PFPCIAddress != "0000:08:00.0" || spec.VFIndex != 0 || spec.IOMMUGroup != 42 {
+	if spec.PFPCIAddress != "0000:08:00.0" || spec.VFIndex != 0 || spec.IOMMUGroup != 42 {
 		t.Fatalf("unexpected spec: %#v", spec)
 	}
 
-	// IB VF landed in its pool.
+	// IB VF is advertised with its link type.
 	idx, ok = byName["pci-0000-0c-00-2"]
 	if !ok {
 		t.Fatalf("IB VF missing: %v", deviceNames(devices))
 	}
-	if got := *devices[idx].Attributes[AttrResourceName].StringValue; got != "petasus.io/ib-compute" {
-		t.Fatalf("unexpected IB resourceName: %q", got)
+	if got := *devices[idx].Attributes[AttrDomain+"/linkType"].StringValue; got != "infiniband" {
+		t.Fatalf("unexpected IB linkType: %q", got)
 	}
 	// The vfio-bound VF inherits RDMA capability from its kernel-bound PF.
 	if got := *devices[idx].Attributes[AttrDomain+"/rdmaCapable"].BoolValue; !got {
 		t.Fatal("VF of an RDMA PF must be rdmaCapable")
 	}
 
-	// Whole-PF pool with resourceName default.
+	// Whole vfio-bound PF.
 	idx, ok = byName["pci-0000-51-00-0"]
 	if !ok {
 		t.Fatalf("PF device missing: %v", deviceNames(devices))
@@ -161,47 +149,6 @@ func TestBuildDevices(t *testing.T) {
 	}
 }
 
-func TestBuildDevicesUnmatchedAndBrokenConfig(t *testing.T) {
-	b := inventoryFixture(t)
-
-	// A config matching nothing advertises nothing.
-	inv := New(writeConfig(t, "pools:\n  - {name: other, pfNames: [enp99s0]}\n"), "node-1", WithSysfs(b.ops()))
-	devices, _ := inv.buildDevices()
-	if len(devices) != 0 {
-		t.Fatalf("expected no devices, got %v", deviceNames(devices))
-	}
-
-	// A broken config advertises nothing rather than everything.
-	inv = New(writeConfig(t, "pools:\n  - {name: a}\n"), "node-1", WithSysfs(b.ops()))
-	devices, _ = inv.buildDevices()
-	if len(devices) != 0 {
-		t.Fatalf("expected no devices for invalid config, got %v", deviceNames(devices))
-	}
-}
-
-func TestBuildDevicesByPFPciAddress(t *testing.T) {
-	b := inventoryFixture(t)
-
-	config := "pools:\n  - name: by-pf\n    pfPciAddressesByNode:\n      node-1: [\"0000:08:00.0\"]\n"
-	inv := New(writeConfig(t, config), "node-1", WithSysfs(b.ops()))
-	devices, _ := inv.buildDevices()
-	if len(devices) != 2 {
-		t.Fatalf("expected the 2 VFs of 0000:08:00.0, got %v", deviceNames(devices))
-	}
-	for _, dev := range devices {
-		if got := *dev.Attributes[AttrDomain+"/pool"].StringValue; got != "by-pf" {
-			t.Fatalf("expected pool by-pf, got %q", got)
-		}
-	}
-
-	// The same selector matches nothing on a node the map does not list.
-	inv = New(writeConfig(t, config), "node-2", WithSysfs(b.ops()))
-	devices, _ = inv.buildDevices()
-	if len(devices) != 0 {
-		t.Fatalf("expected no devices on an unlisted node, got %v", deviceNames(devices))
-	}
-}
-
 // TestBuildDevicesUplinkVlans: ethernet VFs publish their PF uplink's VLAN
 // snapshot; InfiniBand and whole-PF devices publish none.
 func TestBuildDevicesUplinkVlans(t *testing.T) {
@@ -217,7 +164,7 @@ func TestBuildDevicesUplinkVlans(t *testing.T) {
 		{Vid: 102}, {Vid: 100}, {Vid: 101}, {Vid: 200},
 	}
 
-	inv := New(writeConfig(t, inventoryConfig), "node-1", WithSysfs(b.ops()), WithNetlink(nlops))
+	inv := New("node-1", WithSysfs(b.ops()), WithNetlink(nlops))
 	devices, _ := inv.buildDevices()
 
 	byName := map[string]resourceapi.Device{}
@@ -262,7 +209,7 @@ func TestBuildDevicesUplinkNoBridge(t *testing.T) {
 	nlops := newFakeNetlink()
 	nlops.addLink("enp8s0f0np0", "device", 1, 0, 1500)
 
-	inv := New(writeConfig(t, inventoryConfig), "node-1", WithSysfs(b.ops()), WithNetlink(nlops))
+	inv := New("node-1", WithSysfs(b.ops()), WithNetlink(nlops))
 	devices, _ := inv.buildDevices()
 
 	for _, dev := range devices {

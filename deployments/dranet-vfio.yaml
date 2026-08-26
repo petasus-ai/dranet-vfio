@@ -1,10 +1,11 @@
-# dranet-vfio: DRA kubelet plugin that advertises vfio-pci-bound
-# Ethernet/InfiniBand PF/VF functions as pool devices, applies Ethernet-VF
-# host configuration (MAC/VLAN via the PF, representor bridging in
-# switchdev mode), and injects the /dev/vfio character devices plus the
-# KEP-5304 PCI-address metadata into consuming pods. Pool definitions come
-# from the dranet-vfio-config ConfigMap; the file is re-read periodically,
-# so pool edits and newly bound devices need no driver restart.
+# dranet-vfio: DRA kubelet plugin that advertises every vfio-pci-bound
+# Ethernet/InfiniBand PF/VF function as a DRA device carrying hardware-fact
+# attributes (selection policy lives in DeviceClass CEL on the management
+# side), applies Ethernet-VF host configuration (MAC/VLAN via the PF,
+# representor bridging in switchdev mode), and injects the /dev/vfio
+# character devices plus the KEP-5304 PCI-address metadata into consuming
+# pods. The host is rescanned periodically, so newly bound devices need no
+# driver restart.
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
@@ -150,9 +151,6 @@ spec:
               mountPath: /host/var/run
             - name: state
               mountPath: /var/run/dranet-vfio
-            - name: config
-              mountPath: /etc/dranet-vfio
-              readOnly: true
       volumes:
         - name: kubelet-plugins
           hostPath:
@@ -176,6 +174,3 @@ spec:
           hostPath:
             path: /var/run/dranet-vfio
             type: DirectoryOrCreate
-        - name: config
-          configMap:
-            name: dranet-vfio-config
