@@ -18,7 +18,11 @@ Driver name: `vfio.petasus.io`.
   Each device is published as a ResourceSlice device `pci-<bdf>` with the
   standard `resource.kubernetes.io/pciBusID` attribute and
   `vfio.petasus.io/{kind,linkType,vendor,deviceID,pfName,pfPciAddress,vfIndex,iommuGroup,pciClass,numaNode,deviceType,rdmaCapable}`
-  (plus the uplink VLAN snapshot on Ethernet VFs whose PF keeps a netdev).
+  (plus the uplink VLAN snapshot on Ethernet VFs whose PF keeps a netdev:
+  `uplink,bridge,vlanFiltering,uplinkVlans,untaggedVlan`, and
+  `uplinkVlansExact` — a comma-padded full VID enumeration for CEL
+  `contains(",<vid>,")` membership tests, with `uplinkVlansExactOverflow`
+  as the permissive escape when the set exceeds the 64-char attribute cap).
   The host is rescanned periodically (`--rescan-interval`), so newly bound
   devices need no driver restart.
 
