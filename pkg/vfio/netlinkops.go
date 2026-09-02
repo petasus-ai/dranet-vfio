@@ -17,11 +17,13 @@ limitations under the License.
 package vfio
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
+	"golang.org/x/sys/unix"
 )
 
 // NetlinkOps abstracts netlink operations for testability.
@@ -53,6 +55,16 @@ type NetlinkOps interface {
 
 	// VF info query
 	LinkGetVfInfo(pfName string, vf int) (*VfInfo, error)
+	// LinkGetVfIbGUIDs reads the administrative InfiniBand node/port GUID of
+	// every VF of the PF netdev (rtnetlink IFLA_VF_IB_*_GUID), keyed by VF index.
+	LinkGetVfIbGUIDs(pfName string) (map[int]VfIbGUID, error)
+}
+
+// VfIbGUID is one VF's administrative InfiniBand GUIDs as the PF reports them
+// (all zeros = unprogrammed).
+type VfIbGUID struct {
+	NodeGUID [8]byte
+	PortGUID [8]byte
 }
 
 // VfInfo holds current VF settings read from the kernel.
@@ -159,4 +171,55 @@ func (o *realNetlink) LinkGetVfInfo(pfName string, vf int) (*VfInfo, error) {
 	}
 	info.Trust = vi.Trust != 0
 	return info, nil
+}
+
+// LinkGetVfIbGUIDs dumps the PF's VF info list with the VF filter and picks
+// the IFLA_VF_IB_NODE_GUID / IFLA_VF_IB_PORT_GUID attributes the upstream
+// mlx5 driver reports (the sysfs sriov/<idx> attributes exist only with OFED).
+func (o *realNetlink) LinkGetVfIbGUIDs(pfName string) (map[int]VfIbGUID, error) {
+	req := nl.NewNetlinkRequest(unix.RTM_GETLINK, 0)
+	req.AddData(nl.NewIfInfomsg(unix.AF_UNSPEC))
+	req.AddData(nl.NewRtAttr(unix.IFLA_IFNAME, nl.ZeroTerminated(pfName)))
+	req.AddData(nl.NewRtAttr(unix.IFLA_EXT_MASK, nl.Uint32Attr(nl.RTEXT_FILTER_VF)))
+	msgs, err := req.Execute(unix.NETLINK_ROUTE, 0)
+	if err != nil {
+		return nil, fmt.Errorf("getlink %s: %w", pfName, err)
+	}
+	out := map[int]VfIbGUID{}
+	for _, m := range msgs {
+		attrs, err := nl.ParseRouteAttr(m[unix.SizeofIfInfomsg:])
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range attrs {
+			if a.Attr.Type != unix.IFLA_VFINFO_LIST {
+				continue
+			}
+			vfs, err := nl.ParseRouteAttr(a.Value)
+			if err != nil {
+				return nil, err
+			}
+			for _, vf := range vfs {
+				fields, err := nl.ParseRouteAttr(vf.Value)
+				if err != nil {
+					return nil, err
+				}
+				idx, g := -1, VfIbGUID{}
+				for _, f := range fields {
+					switch f.Attr.Type {
+					case nl.IFLA_VF_MAC:
+						idx = int(binary.LittleEndian.Uint32(f.Value[0:4]))
+					case nl.IFLA_VF_IB_NODE_GUID:
+						binary.BigEndian.PutUint64(g.NodeGUID[:], nl.DeserializeVfGUID(f.Value).GUID)
+					case nl.IFLA_VF_IB_PORT_GUID:
+						binary.BigEndian.PutUint64(g.PortGUID[:], nl.DeserializeVfGUID(f.Value).GUID)
+					}
+				}
+				if idx >= 0 {
+					out[idx] = g
+				}
+			}
+		}
+	}
+	return out, nil
 }

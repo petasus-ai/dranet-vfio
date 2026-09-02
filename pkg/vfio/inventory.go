@@ -65,6 +65,10 @@ type Spec struct {
 	LinkType     string
 	Class        string
 	IOMMUGroup   int
+	// NodeGUID and PortGUID (16 hex digits) identify an InfiniBand function on
+	// the fabric; empty when unknown.
+	NodeGUID string
+	PortGUID string
 }
 
 // Inventory publishes every vfio-pci-bound network PCI function as a DRA
@@ -77,6 +81,7 @@ type Inventory struct {
 	rescanInterval time.Duration
 	sysfs          SysfsOps
 	netlink        NetlinkOps
+	ibGuids        *ibGuidFile
 
 	mu        sync.RWMutex
 	devices   map[string]resourceapi.Device
@@ -111,6 +116,14 @@ func WithNetlink(n NetlinkOps) Option {
 	}
 }
 
+// WithIbGuidFile points at sriov-daemon's InfiniBand GUID record ("" disables
+// the record source).
+func WithIbGuidFile(path string) Option {
+	return func(inv *Inventory) {
+		inv.ibGuids = newIbGuidFile(path)
+	}
+}
+
 // New creates an Inventory that discovers and advertises vfio-pci-bound
 // network devices.
 func New(nodeName string, opts ...Option) *Inventory {
@@ -119,6 +132,7 @@ func New(nodeName string, opts ...Option) *Inventory {
 		rescanInterval: defaultRescanInterval,
 		sysfs:          NewSysfs(),
 		netlink:        NewNetlink(),
+		ibGuids:        newIbGuidFile(DefaultIbGuidFile),
 		devices:        map[string]resourceapi.Device{},
 		specs:          map[string]Spec{},
 		notifications:  make(chan []resourceapi.Device, 1),
@@ -190,6 +204,7 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 	// Per-pass memo: many VFs share one parent PF, and one bridge VLAN dump
 	// serves every PF.
 	uplinks := uplinkResolver{netlink: inv.netlink, sysfs: inv.sysfs, states: map[string]*uplinkState{}}
+	guids := guidResolver{netlink: inv.netlink, record: inv.ibGuids}
 
 	for _, bdf := range bdfs {
 		spec, err := inv.describeDevice(bdf)
@@ -209,6 +224,7 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 		if spec.Kind == KindVF && spec.LinkType == LinkTypeEthernet && spec.PFName != "" {
 			up = uplinks.stateFor(spec.PFName)
 		}
+		spec.NodeGUID, spec.PortGUID = guids.resolve(spec)
 
 		device := inv.buildDevice(spec, up)
 		devices = append(devices, device)
@@ -365,6 +381,14 @@ func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Devic
 	}
 	if spec.Kind == KindVF {
 		device.Attributes[AttrDomain+"/vfIndex"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(spec.VFIndex))}
+	}
+	// Fabric identity of an InfiniBand function; absent when unknown (a CEL
+	// guard tests presence, so an empty value must never be published).
+	if spec.NodeGUID != "" {
+		device.Attributes[AttrDomain+"/nodeGUID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.NodeGUID)}
+	}
+	if spec.PortGUID != "" {
+		device.Attributes[AttrDomain+"/portGUID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.PortGUID)}
 	}
 	if numa, err := inv.sysfs.GetNumaNode(spec.PCIAddress); err == nil && numa >= 0 {
 		device.Attributes[AttrDomain+"/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(numa))}

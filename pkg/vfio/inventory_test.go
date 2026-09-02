@@ -17,7 +17,11 @@ limitations under the License.
 package vfio
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/vishvananda/netlink/nl"
 
@@ -241,4 +245,77 @@ func deviceNames(devices []resourceapi.Device) []string {
 		names = append(names, dev.Name)
 	}
 	return names
+}
+
+// TestBuildDevices_InfinibandGUIDs: an IB VF publishes the GUIDs its PF
+// reports through rtnetlink; a whole IB PF (no host driver) and a VF whose PF
+// reports zeros fall back to sriov-daemon's record; a function with neither
+// source carries no GUID attributes at all.
+func TestBuildDevices_InfinibandGUIDs(t *testing.T) {
+	b := inventoryFixture(t)
+	// Second IB VF on the same PF: unprogrammed on the PF, present in the record.
+	b.device("0000:0c:00.3", "0x020700", "vfio-pci", "51")
+	b.vf("0000:0c:00.3", "0000:0c:00.0", "1")
+	// Whole IB PF bound to vfio-pci, recorded.
+	b.device("0000:18:00.0", "0x020700", "vfio-pci", "80")
+	// Whole IB PF bound to vfio-pci, not recorded anywhere.
+	b.device("0000:3e:00.0", "0x020700", "vfio-pci", "81")
+
+	recordPath := filepath.Join(t.TempDir(), "ib-guids.json")
+	record := `{"version":1,"updatedAt":"2026-09-02T00:00:00Z","devices":{
+	  "0000:18:00.0":{"kind":"pf","ibdev":"ibp24s0","nodeGUID":"3825f30300928354","portGUID":"3825f30300928354","recordedAt":"2026-09-02T00:00:00Z"},
+	  "0000:0c:00.3":{"kind":"vf","pfPciAddress":"0000:0c:00.0","vfIndex":1,"nodeGUID":"3a25f30200928354","portGUID":"3a25f30200928354","recordedAt":"2026-09-02T00:00:00Z"}}}`
+	if err := os.WriteFile(recordPath, []byte(record), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nlops := newFakeNetlink()
+	var live VfIbGUID
+	copy(live.NodeGUID[:], []byte{0x3a, 0x25, 0xf3, 0x01, 0x00, 0x92, 0x83, 0x54})
+	live.PortGUID = live.NodeGUID
+	nlops.vfIbGuids = map[string]map[int]VfIbGUID{"ibp12s0": {0: live, 1: {}}}
+
+	inv := New("node-1", WithSysfs(b.ops()), WithNetlink(nlops), WithIbGuidFile(recordPath))
+	devices, specs := inv.buildDevices()
+	byName := map[string]resourceapi.Device{}
+	for _, dev := range devices {
+		byName[dev.Name] = dev
+	}
+	guid := func(name, attr string) string {
+		if a, ok := byName[name].Attributes[resourceapi.QualifiedName(AttrDomain+"/"+attr)]; ok {
+			return *a.StringValue
+		}
+		return "<absent>"
+	}
+	if got := guid("pci-0000-0c-00-2", "portGUID"); got != "3a25f30100928354" {
+		t.Errorf("live VF portGUID = %s", got)
+	}
+	if got := guid("pci-0000-0c-00-3", "nodeGUID"); got != "3a25f30200928354" {
+		t.Errorf("record-backed VF nodeGUID = %s", got)
+	}
+	if got := guid("pci-0000-18-00-0", "portGUID"); got != "3825f30300928354" {
+		t.Errorf("whole PF portGUID = %s", got)
+	}
+	if got := guid("pci-0000-3e-00-0", "portGUID"); got != "<absent>" {
+		t.Errorf("unrecorded PF must carry no portGUID, got %s", got)
+	}
+	if got := guid("pci-0000-08-00-2", "portGUID"); got != "<absent>" {
+		t.Errorf("Ethernet VF must carry no portGUID, got %s", got)
+	}
+	if specs["pci-0000-18-00-0"].NodeGUID != "3825f30300928354" {
+		t.Errorf("spec NodeGUID = %q", specs["pci-0000-18-00-0"].NodeGUID)
+	}
+
+	// A record written later is picked up on the next pass (mtime change).
+	time.Sleep(10 * time.Millisecond)
+	record2 := strings.Replace(record, `"0000:18:00.0":`, `"0000:3e:00.0":{"kind":"pf","nodeGUID":"3825f30300923f34","portGUID":"3825f30300923f34"},"0000:18:00.0":`, 1)
+	if err := os.WriteFile(recordPath, []byte(record2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	devices, _ = inv.buildDevices()
+	for _, dev := range devices {
+		byName[dev.Name] = dev
+	}
+	if got := guid("pci-0000-3e-00-0", "portGUID"); got != "3825f30300923f34" {
+		t.Errorf("late record not picked up: %s", got)
+	}
 }

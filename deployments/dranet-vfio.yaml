@@ -104,6 +104,7 @@ spec:
             - /dranet
             - --v=4
             - --hostname-override=$(NODE_NAME)
+            - --ib-guid-file=/var/lib/petasus/ib-guids.json
           image: quay.io/edgestack/dranet-vfio:v0.1.0
           env:
             - name: NODE_NAME
@@ -151,6 +152,12 @@ spec:
               mountPath: /host/var/run
             - name: state
               mountPath: /var/run/dranet-vfio
+            # sriov-daemon's InfiniBand GUID record (its StateDirectory):
+            # nodeGUID/portGUID of vfio-bound functions whose host driver is
+            # gone. Same path in-container and on the host.
+            - name: petasus-state
+              mountPath: /var/lib/petasus
+              readOnly: true
       volumes:
         - name: kubelet-plugins
           hostPath:
@@ -173,4 +180,8 @@ spec:
         - name: state
           hostPath:
             path: /var/run/dranet-vfio
+            type: DirectoryOrCreate
+        - name: petasus-state
+          hostPath:
+            path: /var/lib/petasus
             type: DirectoryOrCreate

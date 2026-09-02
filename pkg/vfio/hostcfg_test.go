@@ -93,6 +93,7 @@ type fakeNetlink struct {
 	vfInfo      map[string][]*VfInfo // by PF name
 	eswitchMode map[string]string
 	vlanTable   map[int32][]*nl.BridgeVlanInfo
+	vfIbGuids   map[string]map[int]VfIbGUID // by PF name
 	calls       []string
 	failOn      map[string]error
 }
@@ -120,6 +121,13 @@ func (f *fakeNetlink) addLink(name, linkType string, index, master, mtu int) {
 func (f *fakeNetlink) record(call string) error {
 	f.calls = append(f.calls, call)
 	return f.failOn[call]
+}
+
+func (f *fakeNetlink) LinkGetVfIbGUIDs(pfName string) (map[int]VfIbGUID, error) {
+	if f.vfIbGuids == nil {
+		return nil, fmt.Errorf("no VF GUID info for %s", pfName)
+	}
+	return f.vfIbGuids[pfName], nil
 }
 
 func (f *fakeNetlink) LinkByName(name string) (netlink.Link, error) {
