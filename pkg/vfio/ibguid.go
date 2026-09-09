@@ -34,10 +34,12 @@ const DefaultIbGuidFile = "/var/lib/petasus/ib-guids.json"
 
 // ibGuidRecord mirrors sriov-daemon's record schema (version 1): the
 // InfiniBand node/port GUID of every function it handed to vfio-pci, keyed
-// by PCI address, as 16 lowercase hex digits.
+// by PCI address, as 16 lowercase hex digits, and the RDMA device the GUIDs
+// were read from (a VF entry carries its PF's).
 type ibGuidRecord struct {
 	Version int `json:"version"`
 	Devices map[string]struct {
+		Ibdev    string `json:"ibdev"`
 		NodeGUID string `json:"nodeGUID"`
 		PortGUID string `json:"portGUID"`
 	} `json:"devices"`
@@ -56,22 +58,23 @@ type ibGuidFile struct {
 
 func newIbGuidFile(path string) *ibGuidFile { return &ibGuidFile{path: path} }
 
-// Lookup returns the recorded node/port GUID of pci ("" when unknown).
-func (f *ibGuidFile) Lookup(pci string) (node, port string) {
+// Lookup returns the recorded node/port GUID and RDMA device name of pci
+// ("" when unknown).
+func (f *ibGuidFile) Lookup(pci string) (node, port, rdma string) {
 	if f == nil || f.path == "" {
-		return "", ""
+		return "", "", ""
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refresh()
 	if f.record == nil {
-		return "", ""
+		return "", "", ""
 	}
 	dev, ok := f.record.Devices[pci]
 	if !ok {
-		return "", ""
+		return "", "", ""
 	}
-	return normalizeGUID(dev.NodeGUID), normalizeGUID(dev.PortGUID)
+	return normalizeGUID(dev.NodeGUID), normalizeGUID(dev.PortGUID), strings.TrimSpace(dev.Ibdev)
 }
 
 func (f *ibGuidFile) refresh() {
@@ -129,17 +132,18 @@ func guidBytesToString(b [8]byte) string {
 // guidResolver resolves the node/port GUID of InfiniBand devices during one
 // inventory pass: a VF's administrative GUIDs live on its PF netdev (read
 // once per PF), a whole PF's only in the record; the record backs a VF whose
-// PF reports nothing. Unknown stays unknown — attributes are omitted, never
-// published empty.
+// PF reports nothing. A whole PF also takes the RDMA device name it exposed
+// before binding from the record (a VF has its PF's netdev name instead).
+// Unknown stays unknown — attributes are omitted, never published empty.
 type guidResolver struct {
 	netlink NetlinkOps
 	record  *ibGuidFile
 	byPF    map[string]map[int]VfIbGUID
 }
 
-func (r *guidResolver) resolve(spec *Spec) (node, port string) {
+func (r *guidResolver) resolve(spec *Spec) (node, port, rdma string) {
 	if spec.LinkType != LinkTypeInfiniband {
-		return "", ""
+		return "", "", ""
 	}
 	if spec.Kind == KindVF && spec.PFName != "" {
 		if r.byPF == nil {
@@ -157,18 +161,21 @@ func (r *guidResolver) resolve(spec *Spec) (node, port string) {
 		if g, ok := vfs[spec.VFIndex]; ok {
 			node, port = guidBytesToString(g.NodeGUID), guidBytesToString(g.PortGUID)
 			if node != "" && port != "" {
-				return node, port
+				return node, port, ""
 			}
 		}
 	}
-	rn, rp := r.record.Lookup(spec.PCIAddress)
+	rn, rp, rr := r.record.Lookup(spec.PCIAddress)
 	if node == "" {
 		node = rn
 	}
 	if port == "" {
 		port = rp
 	}
-	return node, port
+	if spec.Kind == KindPF {
+		rdma = rr
+	}
+	return node, port, rdma
 }
 
 func (r *guidResolver) String() string {

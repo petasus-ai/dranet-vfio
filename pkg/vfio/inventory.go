@@ -69,6 +69,9 @@ type Spec struct {
 	// the fabric; empty when unknown.
 	NodeGUID string
 	PortGUID string
+	// RDMADevice is the RDMA device a whole InfiniBand PF exposed before it
+	// was bound to vfio-pci (from sriov-daemon's record); empty when unknown.
+	RDMADevice string
 }
 
 // Inventory publishes every vfio-pci-bound network PCI function as a DRA
@@ -224,7 +227,7 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 		if spec.Kind == KindVF && spec.LinkType == LinkTypeEthernet && spec.PFName != "" {
 			up = uplinks.stateFor(spec.PFName)
 		}
-		spec.NodeGUID, spec.PortGUID = guids.resolve(spec)
+		spec.NodeGUID, spec.PortGUID, spec.RDMADevice = guids.resolve(spec)
 
 		device := inv.buildDevice(spec, up)
 		devices = append(devices, device)
@@ -389,6 +392,9 @@ func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Devic
 	}
 	if spec.PortGUID != "" {
 		device.Attributes[AttrDomain+"/portGUID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.PortGUID)}
+	}
+	if spec.RDMADevice != "" {
+		device.Attributes[AttrDomain+"/rdmaDevice"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.RDMADevice)}
 	}
 	if numa, err := inv.sysfs.GetNumaNode(spec.PCIAddress); err == nil && numa >= 0 {
 		device.Attributes[AttrDomain+"/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(numa))}

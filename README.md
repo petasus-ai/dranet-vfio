@@ -22,7 +22,9 @@ Driver name: `vfio.petasus.io`.
   as 16 hex digits — a VF's from the administrative GUIDs its PF netdev
   reports over rtnetlink, a whole PF's from sriov-daemon's record
   `/var/lib/petasus/ib-guids.json` (`--ib-guid-file`, mounted read-only),
-  which also backs a VF whose PF reports zeros; unknown = attribute absent;
+  which also backs a VF whose PF reports zeros, and, on a whole PF, the
+  record's `ibdev` as `rdmaDevice` — the RDMA device name the PF exposed
+  before it was bound; unknown = attribute absent;
   plus the uplink VLAN snapshot on Ethernet VFs whose PF keeps a netdev:
   `uplink,bridge,vlanFiltering,uplinkVlans,untaggedVlan`, and
   `uplinkVlansExact` — a comma-padded full VID enumeration for CEL

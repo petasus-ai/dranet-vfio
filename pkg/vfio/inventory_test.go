@@ -298,6 +298,14 @@ func TestBuildDevices_InfinibandGUIDs(t *testing.T) {
 	if got := guid("pci-0000-3e-00-0", "portGUID"); got != "<absent>" {
 		t.Errorf("unrecorded PF must carry no portGUID, got %s", got)
 	}
+	if got := guid("pci-0000-18-00-0", "rdmaDevice"); got != "ibp24s0" {
+		t.Errorf("whole PF rdmaDevice = %s", got)
+	}
+	for _, name := range []string{"pci-0000-3e-00-0", "pci-0000-0c-00-3"} {
+		if got := guid(name, "rdmaDevice"); got != "<absent>" {
+			t.Errorf("%s must carry no rdmaDevice, got %s", name, got)
+		}
+	}
 	if got := guid("pci-0000-08-00-2", "portGUID"); got != "<absent>" {
 		t.Errorf("Ethernet VF must carry no portGUID, got %s", got)
 	}
