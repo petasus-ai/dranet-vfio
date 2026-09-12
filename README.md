@@ -17,7 +17,9 @@ Driver name: `vfio.petasus.io`.
 
   Each device is published as a ResourceSlice device `pci-<bdf>` with the
   standard `resource.kubernetes.io/pciBusID` attribute and
-  `vfio.petasus.io/{kind,linkType,vendor,deviceID,pfName,pfPciAddress,vfIndex,iommuGroup,pciClass,numaNode,deviceType,rdmaCapable}`
+  `vfio.petasus.io/{nodeName,kind,linkType,vendor,deviceID,pfName,pfPciAddress,vfIndex,iommuGroup,pciClass,numaNode,deviceType,rdmaCapable}`
+  (`nodeName` is the node the slice is published for, so a DeviceClass CEL
+  can select a parent PF per node — CEL sees device attributes only)
   (plus, on InfiniBand functions, the fabric identity `nodeGUID`/`portGUID`
   as 16 hex digits — a VF's from the administrative GUIDs its PF netdev
   reports over rtnetlink, a whole PF's from sriov-daemon's record

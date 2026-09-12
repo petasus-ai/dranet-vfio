@@ -371,6 +371,7 @@ func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Devic
 			deviceattribute.StandardDeviceAttributePCIBusID: {StringValue: ptr.To(spec.PCIAddress)},
 			AttrDomain + "/kind":                            {StringValue: ptr.To(spec.Kind)},
 			AttrDomain + "/linkType":                        {StringValue: ptr.To(spec.LinkType)},
+			AttrDomain + "/nodeName":                        {StringValue: ptr.To(inv.nodeName)},
 			AttrDomain + "/pciClass":                        {StringValue: ptr.To(spec.Class)},
 			AttrDomain + "/iommuGroup":                      {IntValue: ptr.To(int64(spec.IOMMUGroup))},
 			AttrDomain + "/deviceType":                      {StringValue: ptr.To("vfio-pci")},

@@ -73,6 +73,9 @@ func TestBuildDevices(t *testing.T) {
 	byName := map[string]int{}
 	for i, dev := range devices {
 		byName[dev.Name] = i
+		if got := *dev.Attributes[AttrDomain+"/nodeName"].StringValue; got != "node-1" {
+			t.Fatalf("%s: unexpected nodeName: %q", dev.Name, got)
+		}
 	}
 
 	// Ethernet VF.
