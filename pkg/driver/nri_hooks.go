@@ -115,6 +115,12 @@ func (np *NetworkDriver) createContainer(_ context.Context, _ *api.PodSandbox, _
 				Minor: dev.Minor,
 			})
 		}
+		// Entries prepared with a CDI device get their vfio devices and
+		// metadata mount from the runtime; inject them here only for
+		// entries prepared without one.
+		if config.CDIDeviceID != "" {
+			continue
+		}
 		// Inject the vfio character devices owned by qemu so virt-launcher
 		// can hand the passthrough NIC to the VM. /dev/vfio/vfio is shared
 		// between devices, hence the path dedup.

@@ -105,7 +105,7 @@ spec:
             - --v=4
             - --hostname-override=$(NODE_NAME)
             - --ib-guid-file=/var/lib/petasus/ib-guids.json
-          image: quay.io/edgestack/dranet-vfio:v0.1.0
+          image: quay.io/edgestack/dranet-vfio:v0.1.1
           env:
             - name: NODE_NAME
               valueFrom:
@@ -152,6 +152,10 @@ spec:
               mountPath: /host/var/run
             - name: state
               mountPath: /var/run/dranet-vfio
+            # CDI specs for prepared claims; the container runtime reads the
+            # same host directory.
+            - name: cdi
+              mountPath: /var/run/cdi
             # sriov-daemon's InfiniBand GUID record (its StateDirectory):
             # nodeGUID/portGUID of vfio-bound functions whose host driver is
             # gone. Same path in-container and on the host.
@@ -180,6 +184,10 @@ spec:
         - name: state
           hostPath:
             path: /var/run/dranet-vfio
+            type: DirectoryOrCreate
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
             type: DirectoryOrCreate
         - name: petasus-state
           hostPath:

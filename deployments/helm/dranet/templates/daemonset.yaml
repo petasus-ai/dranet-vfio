@@ -127,6 +127,8 @@ spec:
               mountPropagation: HostToContainer
             - name: dranet-run
               mountPath: /var/run/dranet
+            - name: cdi
+              mountPath: /var/run/cdi
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -152,6 +154,10 @@ spec:
         - name: dranet-run
           hostPath:
             path: /var/run/dranet
+            type: DirectoryOrCreate
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
             type: DirectoryOrCreate
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

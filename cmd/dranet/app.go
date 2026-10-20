@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/dranet/pkg/driver"
 	"sigs.k8s.io/dranet/pkg/features"
 	"sigs.k8s.io/dranet/pkg/vfio"
+	"sigs.k8s.io/dranet/pkg/vfio/cdi"
 
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/client-go/kubernetes"
@@ -57,6 +58,7 @@ var (
 	rescanInterval   time.Duration
 	ibGuidFile       string
 	vfLockDir        string
+	cdiDir           string
 	featureGates     string
 
 	kubeletRootDir string
@@ -73,6 +75,7 @@ func init() {
 	flag.DurationVar(&rescanInterval, "rescan-interval", 30*time.Second, "How often the host's vfio-pci bindings are rescanned and republished.")
 	flag.StringVar(&ibGuidFile, "ib-guid-file", vfio.DefaultIbGuidFile, "sriov-daemon's InfiniBand GUID record; the source of nodeGUID/portGUID for vfio-bound InfiniBand functions whose PF reports none. Empty disables it.")
 	flag.StringVar(&vfLockDir, "vf-lock-dir", "/host/var/run", "Directory holding the per-bridge flock files serializing bridge-VLAN edits; point it at the host's /var/run so a host-installed sriov-vfio CNI shares the same locks.")
+	flag.StringVar(&cdiDir, "cdi-dir", cdi.DefaultSpecDir, "Directory the container runtime reads generated CDI specs from; it must be the same directory on the host.")
 	flag.StringVar(&kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "The kubelet data directory (its --root-dir). The driver's registration socket lives under <dir>/plugins_registry and its dra.sock under <dir>/plugins/<driver-name>. Set this to match the kubelet --root-dir on clusters that relocate it.")
 	flag.StringVar(&featureGates, "feature-gates", "", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 
@@ -136,6 +139,7 @@ func main() {
 		driver.WithDBPath(dbPath),
 		driver.WithKubeletRootDir(kubeletRootDir),
 		driver.WithVFLockDir(vfLockDir),
+		driver.WithCDIDir(cdiDir),
 	}
 	if celExpression != "" {
 		env, err := cel.NewEnv(

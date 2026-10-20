@@ -18,11 +18,14 @@ package driver
 
 import (
 	"fmt"
+	"os"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/dranet/pkg/vfio"
+	"sigs.k8s.io/dranet/pkg/vfio/cdi"
 	"sigs.k8s.io/dranet/pkg/vfio/metadata"
 )
 
@@ -59,17 +62,20 @@ func vfioSpecOf(db inventoryDB, deviceName string) (vfio.Spec, bool) {
 }
 
 // prepareVfioDevice handles one allocated vfio-pci device: validate it,
-// apply the claim's VF settings on the host, and record everything the NRI
-// hooks and virt-launcher need — the /dev/vfio character devices and the
-// KEP-5304 metadata file carrying the PCI address.
-func (np *NetworkDriver) prepareVfioDevice(claim *resourceapi.ResourceClaim, podUID types.UID, requestName string, result resourceapi.DeviceRequestAllocationResult, spec vfio.Spec) error {
+// apply the claim's VF settings on the host, write the KEP-5304 metadata file
+// carrying the PCI address, and return the CDI device that hands the
+// /dev/vfio character devices and the metadata mount to the pod. The CDI
+// device is claim-scoped, so kubelet also injects it into a pod that reuses
+// the prepared claim without a new prepare (a replacement launcher on the
+// same node while the old sandbox still exists).
+func (np *NetworkDriver) prepareVfioDevice(claim *resourceapi.ResourceClaim, podUID types.UID, requestName string, result resourceapi.DeviceRequestAllocationResult, spec vfio.Spec) (cdi.Device, kubeletplugin.Device, error) {
 	params, err := vfio.ParseClaimParams(claim, np.driverName, requestName)
 	if err != nil {
-		return err
+		return cdi.Device{}, kubeletplugin.Device{}, err
 	}
 
 	if err := np.vfioConfigurer.ValidateIOMMUGroup(spec.IOMMUGroup, spec.PCIAddress); err != nil {
-		return err
+		return cdi.Device{}, kubeletplugin.Device{}, err
 	}
 
 	// Reuse previously captured original VF state: a kubelet retry — or a
@@ -80,7 +86,7 @@ func (np *NetworkDriver) prepareVfioDevice(claim *resourceapi.ResourceClaim, pod
 
 	state, err := np.vfioConfigurer.Apply(spec, params, prior)
 	if err != nil {
-		return fmt.Errorf("failed to configure VFIO device %s: %w", result.Device, err)
+		return cdi.Device{}, kubeletplugin.Device{}, fmt.Errorf("failed to configure VFIO device %s: %w", result.Device, err)
 	}
 	undo := func() {
 		for _, restoreErr := range np.vfioConfigurer.Restore(state) {
@@ -91,7 +97,7 @@ func (np *NetworkDriver) prepareVfioDevice(claim *resourceapi.ResourceClaim, pod
 	devices, err := vfioCharDevices(spec.IOMMUGroup)
 	if err != nil {
 		undo()
-		return err
+		return cdi.Device{}, kubeletplugin.Device{}, err
 	}
 
 	deviceCfg := DeviceConfig{
@@ -110,8 +116,9 @@ func (np *NetworkDriver) prepareVfioDevice(claim *resourceapi.ResourceClaim, pod
 	}
 
 	// Write the KEP-5304 metadata file virt-launcher resolves the PCI
-	// address from; the NRI hook bind-mounts it into the containers.
+	// address from; the CDI device bind-mounts it into the containers.
 	ref := metadata.NewClaimRef(claim)
+	baseRequest := metadata.BaseRequestName(requestName)
 	var attributes map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
 	if deviceCfg.DeviceSnapshot != nil {
 		attributes = deviceCfg.DeviceSnapshot.Attributes
@@ -124,19 +131,54 @@ func (np *NetworkDriver) prepareVfioDevice(claim *resourceapi.ResourceClaim, pod
 	}})
 	if err != nil {
 		undo()
-		return fmt.Errorf("failed to write device metadata for %s: %w", result.Device, err)
+		return cdi.Device{}, kubeletplugin.Device{}, fmt.Errorf("failed to write device metadata for %s: %w", result.Device, err)
 	}
 	deviceCfg.MetadataMount = &BindMount{
 		HostPath:      hostPath,
-		ContainerPath: np.vfioMetadata.ContainerPath(ref, requestName),
+		ContainerPath: np.vfioMetadata.ContainerPath(ref, baseRequest),
 	}
+
+	cdiDevice := vfioCDIDevice(cdi.DeviceName(string(claim.UID), baseRequest, result.Device), devices, *deviceCfg.MetadataMount)
+	deviceCfg.CDIDeviceID = np.vfioCDI.DeviceID(cdiDevice.Name)
 
 	if err := np.podConfigStore.SetDeviceConfig(podUID, result.Device, deviceCfg); err != nil {
 		undo()
-		return fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
+		return cdi.Device{}, kubeletplugin.Device{}, fmt.Errorf("failed to persist device config for pod %s device %s: %v", podUID, result.Device, err)
 	}
 	klog.V(4).Infof("VFIO claim resources for pod %s : %#v", podUID, deviceCfg)
-	return nil
+	return cdiDevice, kubeletplugin.Device{
+		Requests:     []string{baseRequest},
+		PoolName:     result.Pool,
+		DeviceName:   result.Device,
+		CDIDeviceIDs: []string{deviceCfg.CDIDeviceID},
+	}, nil
+}
+
+// vfioCDIDevice is the CDI device carrying one vfio device's character
+// devices, owned by qemu, and its read-only metadata mount.
+func vfioCDIDevice(name string, devices []LinuxDevice, mount BindMount) cdi.Device {
+	dev := cdi.Device{Name: name}
+	for _, d := range devices {
+		mode := os.FileMode(d.FileMode)
+		uid, gid := d.UID, d.GID
+		dev.ContainerEdits.DeviceNodes = append(dev.ContainerEdits.DeviceNodes, cdi.DeviceNode{
+			Path:        d.Path,
+			HostPath:    d.Path,
+			Type:        d.Type,
+			Major:       d.Major,
+			Minor:       d.Minor,
+			FileMode:    &mode,
+			Permissions: "rw",
+			UID:         &uid,
+			GID:         &gid,
+		})
+	}
+	dev.ContainerEdits.Mounts = []cdi.Mount{{
+		HostPath:      mount.HostPath,
+		ContainerPath: mount.ContainerPath,
+		Options:       []string{"ro", "bind"},
+	}}
+	return dev
 }
 
 // findPriorVfioState returns the host state an earlier prepare recorded for

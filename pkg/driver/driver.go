@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/inventory"
 	"sigs.k8s.io/dranet/pkg/vfio"
+	"sigs.k8s.io/dranet/pkg/vfio/cdi"
 	"sigs.k8s.io/dranet/pkg/vfio/metadata"
 
 	"github.com/containerd/nri/pkg/stub"
@@ -107,6 +108,14 @@ func WithKubeletRootDir(dir string) Option {
 	}
 }
 
+// WithCDIDir sets the directory the container runtime reads generated CDI
+// specs from.
+func WithCDIDir(dir string) Option {
+	return func(o *NetworkDriver) {
+		o.cdiDir = dir
+	}
+}
+
 // WithVFLockDir sets the directory holding the per-bridge flock files that
 // serialize bridge-VLAN edits on switchdev VFs.
 func WithVFLockDir(dir string) Option {
@@ -144,6 +153,8 @@ type NetworkDriver struct {
 	vfLockDir      string
 	vfioConfigurer *vfio.Configurer
 	vfioMetadata   *metadata.Writer
+	cdiDir         string
+	vfioCDI        *cdi.Writer
 
 	// claimOpMu serializes prepare/unprepare claim processing. Kubelet can
 	// overlap an in-flight unprepare with the next pod's prepare of the
@@ -218,6 +229,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	}
 	plugin.vfioConfigurer = vfio.NewConfigurer(vfio.NewSysfs(), vfio.NewNetlink(), plugin.vfLockDir)
 	plugin.vfioMetadata = &metadata.Writer{DriverName: driverName, HostRoot: driverPluginPath}
+	plugin.vfioCDI = &cdi.Writer{DriverName: driverName, SpecDir: plugin.cdiDir}
 
 	// Derive the registration and plugin data directories from the kubelet root
 	// dir so they are correct when the kubelet uses a non-default --root-dir. At

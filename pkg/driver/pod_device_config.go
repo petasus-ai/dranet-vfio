@@ -82,6 +82,11 @@ type DeviceConfig struct {
 	// MetadataMount bind-mounts the KEP-5304 device metadata file into the
 	// Pod's containers; virt-launcher reads the PCI address from it.
 	MetadataMount *BindMount `json:"metadataMount,omitempty"`
+
+	// CDIDeviceID is set when VfioDevices and MetadataMount reach the
+	// containers through the CDI device returned from prepare; the NRI hooks
+	// then leave them alone.
+	CDIDeviceID string `json:"cdiDeviceID,omitempty"`
 }
 
 // BindMount describes one read-only bind mount from the host into the

@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/dranet/pkg/features"
 	"sigs.k8s.io/dranet/pkg/filter"
 	"sigs.k8s.io/dranet/pkg/inventory"
+	"sigs.k8s.io/dranet/pkg/vfio/cdi"
 
 	"github.com/Mellanox/rdmamap"
 	"github.com/vishvananda/netlink"
@@ -195,6 +196,8 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 	}
 
 	var errorList []error
+	var cdiDevices []cdi.Device
+	var preparedDevices []kubeletplugin.Device
 	for _, result := range claim.Status.Allocation.Devices.Results {
 		// A single ResourceClaim can have devices managed by distinct DRA
 		// drivers. One common use case for this is device topology alignment
@@ -213,9 +216,13 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		// generic apis.NetworkConfig, so the device is prepared here in
 		// full and the netdev path below never runs.
 		if spec, isVfio := vfioSpecOf(np.netdb, result.Device); isVfio {
-			if err := np.prepareVfioDevice(claim, podUID, requestName, result, spec); err != nil {
+			cdiDevice, prepared, err := np.prepareVfioDevice(claim, podUID, requestName, result, spec)
+			if err != nil {
 				errorList = append(errorList, err)
+				continue
 			}
+			cdiDevices = append(cdiDevices, cdiDevice)
+			preparedDevices = append(preparedDevices, prepared)
 			continue
 		}
 
@@ -475,6 +482,12 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		klog.V(4).Infof("Claim Resources for pod %s : %#v", podUID, deviceCfg)
 	}
 
+	if len(errorList) == 0 && len(cdiDevices) > 0 {
+		if err := np.vfioCDI.Write(string(claim.UID), cdiDevices); err != nil {
+			errorList = append(errorList, fmt.Errorf("failed to write CDI spec for claim %s: %w", claim.UID, err))
+		}
+	}
+
 	if len(errorList) > 0 {
 		joinedErr := errors.Join(errorList...)
 		klog.Infof("claim %s contain errors: %v", claim.UID, joinedErr)
@@ -483,7 +496,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			Err: fmt.Errorf("claim %s contain errors: %w", claim.UID, joinedErr),
 		}
 	}
-	return kubeletplugin.PrepareResult{}
+	return kubeletplugin.PrepareResult{Devices: preparedDevices}
 }
 
 func (np *NetworkDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
@@ -557,6 +570,11 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 	if np.vfioMetadata != nil {
 		if err := np.vfioMetadata.RemoveClaim(claim.Namespace, claim.Name); err != nil {
 			klog.Errorf("failed to remove device metadata for claim %v: %v", claim.NamespacedName, err)
+		}
+	}
+	if np.vfioCDI != nil {
+		if err := np.vfioCDI.Remove(string(claim.UID)); err != nil {
+			klog.Errorf("failed to remove CDI spec for claim %v: %v", claim.NamespacedName, err)
 		}
 	}
 

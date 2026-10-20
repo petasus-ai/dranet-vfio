@@ -51,12 +51,16 @@ Driver name: `vfio.petasus.io`.
   Original VF settings are captured first and restored on
   `NodeUnprepareResources`, surviving driver restarts (bbolt, `--db-path`).
 
-- Via NRI, `/dev/vfio/vfio` and `/dev/vfio/<iommu group>` are injected into
-  the pod's containers owned by uid/gid 107 (qemu in virt-launcher), and the
-  KEP-5304 device metadata file is bind-mounted at
+- Prepare returns one CDI device per vfio device (spec
+  `/var/run/cdi/vfio.petasus.io_<claim UID>.json`, `--cdi-dir`): it carries
+  `/dev/vfio/vfio` and `/dev/vfio/<iommu group>` owned by uid/gid 107 (qemu
+  in virt-launcher) and bind-mounts the KEP-5304 device metadata file at
   `/var/run/kubernetes.io/dra-device-attributes/resourceclaims/<claim>/<request>/vfio.petasus.io-metadata.json`,
   where KubeVirt's DRA path reads `resource.kubernetes.io/pciBusID` to build
-  the libvirt `<hostdev>`.
+  the libvirt `<hostdev>`. Kubelet injects the CDI device into the containers
+  that reference the claim, also for a pod that reuses a claim already
+  prepared on the node (a replacement launcher while the old sandbox still
+  exists). Entries prepared without a CDI device get the same edits via NRI.
 
 - VF settings arrive per claim via the opaque device config:
 
