@@ -120,13 +120,13 @@ spec:
           startupProbe:
             httpGet:
               path: /healthz
-              port: 9177
+              port: 9178
             failureThreshold: 12
             periodSeconds: 5
           readinessProbe:
             httpGet:
               path: /healthz
-              port: 9177
+              port: 9178
           volumeMounts:
             # Mounted 1:1 so the KEP-5304 metadata files the driver writes
             # under plugins/vfio.petasus.io/dra-device-metadata have the same
