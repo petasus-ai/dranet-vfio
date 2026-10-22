@@ -1,0 +1,561 @@
+/*
+Copyright The Kubernetes Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package vfio
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"sigs.k8s.io/dranet/pkg/apis"
+	"sigs.k8s.io/dranet/pkg/names"
+
+	"github.com/vishvananda/netlink/nl"
+
+	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/dynamic-resource-allocation/deviceattribute"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
+)
+
+const (
+	// AttrDomain is the attribute domain of this driver's device attributes.
+	AttrDomain = "vfio.petasus.io"
+
+	// KindVF and KindPF classify a function as an SR-IOV VF or a whole PF.
+	KindVF = "vf"
+	KindPF = "pf"
+
+	// LinkTypeEthernet, LinkTypeInfiniband and LinkTypeOther classify a
+	// device by PCI class: 0x0200* is Ethernet, 0x0207*/0x0c06* is
+	// InfiniBand, every other network class is "other".
+	LinkTypeEthernet   = "ethernet"
+	LinkTypeInfiniband = "infiniband"
+	LinkTypeOther      = "other"
+
+	defaultRescanInterval = 30 * time.Second
+)
+
+// Spec describes one published device for the prepare path.
+type Spec struct {
+	PCIAddress   string
+	PFPCIAddress string
+	PFName       string
+	VFIndex      int
+	Kind         string
+	LinkType     string
+	Class        string
+	IOMMUGroup   int
+	// NodeGUID and PortGUID (16 hex digits) identify an InfiniBand function on
+	// the fabric; empty when unknown.
+	NodeGUID string
+	PortGUID string
+	// RDMADevice is the RDMA device a whole InfiniBand PF exposed before it
+	// was bound to vfio-pci (from sriov-daemon's record); empty when unknown.
+	RDMADevice string
+}
+
+// Inventory publishes every vfio-pci-bound network PCI function as a DRA
+// device carrying hardware-fact attributes only; selection policy lives in
+// DeviceClass CEL on the management side. Hardware is discovered from sysfs
+// and rescanned periodically, so newly bound devices propagate without a
+// driver restart.
+type Inventory struct {
+	nodeName       string
+	rescanInterval time.Duration
+	sysfs          SysfsOps
+	netlink        NetlinkOps
+	ibGuids        *ibGuidFile
+
+	mu        sync.RWMutex
+	devices   map[string]resourceapi.Device
+	specs     map[string]Spec
+	published []resourceapi.Device
+
+	notifications chan []resourceapi.Device
+	rescan        chan struct{}
+}
+
+// Option customizes the Inventory.
+type Option func(*Inventory)
+
+// WithRescanInterval overrides how often the hardware is rescanned.
+func WithRescanInterval(d time.Duration) Option {
+	return func(inv *Inventory) {
+		inv.rescanInterval = d
+	}
+}
+
+// WithSysfs overrides the sysfs implementation (for testing).
+func WithSysfs(s SysfsOps) Option {
+	return func(inv *Inventory) {
+		inv.sysfs = s
+	}
+}
+
+// WithNetlink overrides the netlink implementation (for testing).
+func WithNetlink(n NetlinkOps) Option {
+	return func(inv *Inventory) {
+		inv.netlink = n
+	}
+}
+
+// WithIbGuidFile points at sriov-daemon's InfiniBand GUID record ("" disables
+// the record source).
+func WithIbGuidFile(path string) Option {
+	return func(inv *Inventory) {
+		inv.ibGuids = newIbGuidFile(path)
+	}
+}
+
+// New creates an Inventory that discovers and advertises vfio-pci-bound
+// network devices.
+func New(nodeName string, opts ...Option) *Inventory {
+	inv := &Inventory{
+		nodeName:       nodeName,
+		rescanInterval: defaultRescanInterval,
+		sysfs:          NewSysfs(),
+		netlink:        NewNetlink(),
+		ibGuids:        newIbGuidFile(DefaultIbGuidFile),
+		devices:        map[string]resourceapi.Device{},
+		specs:          map[string]Spec{},
+		notifications:  make(chan []resourceapi.Device, 1),
+		rescan:         make(chan struct{}, 1),
+	}
+	for _, o := range opts {
+		o(inv)
+	}
+	return inv
+}
+
+// Run keeps the published device list in sync with the host's vfio-pci
+// bindings until the context is cancelled: the periodic rescan makes newly
+// bound devices appear without a restart.
+func (inv *Inventory) Run(ctx context.Context) error {
+	inv.sync(true)
+	ticker := time.NewTicker(inv.rescanInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			inv.sync(false)
+		case <-inv.rescan:
+			inv.sync(false)
+		}
+	}
+}
+
+// sync rebuilds the device list and notifies the publisher when the list
+// changed (or unconditionally on the first pass, so an empty device set
+// still results in an initial publish).
+func (inv *Inventory) sync(force bool) {
+	devices, specs := inv.buildDevices()
+
+	inv.mu.Lock()
+	changed := !reflect.DeepEqual(devices, inv.published)
+	if changed || force {
+		inv.published = devices
+		inv.devices = map[string]resourceapi.Device{}
+		for _, dev := range devices {
+			inv.devices[dev.Name] = dev
+		}
+		inv.specs = specs
+	}
+	inv.mu.Unlock()
+
+	if changed || force {
+		// Coalesce: drop a stale pending notification before sending the new one.
+		select {
+		case <-inv.notifications:
+		default:
+		}
+		inv.notifications <- devices
+	}
+}
+
+func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
+	devices := []resourceapi.Device{}
+	specs := map[string]Spec{}
+
+	bdfs, err := inv.sysfs.ListVFIODevices()
+	if err != nil {
+		klog.Errorf("vfio inventory: failed to list vfio-pci devices, advertising nothing: %v", err)
+		return devices, specs
+	}
+
+	// Per-pass memo: many VFs share one parent PF, and one bridge VLAN dump
+	// serves every PF.
+	uplinks := uplinkResolver{netlink: inv.netlink, sysfs: inv.sysfs, states: map[string]*uplinkState{}}
+	guids := guidResolver{netlink: inv.netlink, record: inv.ibGuids}
+
+	for _, bdf := range bdfs {
+		spec, err := inv.describeDevice(bdf)
+		if err != nil {
+			klog.Warningf("vfio inventory: skipping device %s: %v", bdf, err)
+			continue
+		}
+		if spec == nil {
+			// Not a network-class device: vfio-pci also carries GPUs and
+			// other passthrough functions owned by different drivers.
+			continue
+		}
+
+		// Uplink VLAN state applies only where the VLAN prepare path does:
+		// an ethernet VF whose PF keeps a kernel netdev.
+		var up *uplinkState
+		if spec.Kind == KindVF && spec.LinkType == LinkTypeEthernet && spec.PFName != "" {
+			up = uplinks.stateFor(spec.PFName)
+		}
+		spec.NodeGUID, spec.PortGUID, spec.RDMADevice = guids.resolve(spec)
+
+		device := inv.buildDevice(spec, up)
+		devices = append(devices, device)
+		specs[device.Name] = *spec
+	}
+	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
+	return devices, specs
+}
+
+// uplinkState is one PF's uplink snapshot, published as device attributes so
+// the management platform can validate a requested VLAN at network create.
+// Empty/false "has" fields mean the step could not be resolved and nothing is
+// published for it — a consumer must treat absence as unknown, not as "not
+// carried"; the prepare path stays the authority.
+type uplinkState struct {
+	uplink       string
+	bridge       string
+	filtering    bool
+	hasFiltering bool
+	vlans        []*nl.BridgeVlanInfo
+	hasVlans     bool
+}
+
+// uplinkResolver memoizes uplinkState per PF within one sync pass and fetches
+// the bridge VLAN dump at most once per pass.
+type uplinkResolver struct {
+	netlink        NetlinkOps
+	sysfs          SysfsOps
+	states         map[string]*uplinkState
+	vlanMap        map[int32][]*nl.BridgeVlanInfo
+	vlanMapFetched bool
+}
+
+func (r *uplinkResolver) stateFor(pfName string) *uplinkState {
+	if st, ok := r.states[pfName]; ok {
+		return st
+	}
+	st := &uplinkState{}
+	r.states[pfName] = st
+	uplink, err := detectUplink(r.netlink, pfName)
+	if err != nil {
+		klog.V(4).Infof("vfio inventory: no uplink for PF %s: %v", pfName, err)
+		return st
+	}
+	st.uplink = uplink
+	bridge, err := detectBridge(r.netlink, uplink)
+	if err != nil {
+		klog.V(4).Infof("vfio inventory: no bridge for uplink %s: %v", uplink, err)
+		return st
+	}
+	st.bridge = bridge
+	filtering, err := r.sysfs.GetBridgeVlanFiltering(bridge)
+	if err != nil {
+		klog.V(4).Infof("vfio inventory: bridge %s vlan_filtering unreadable: %v", bridge, err)
+		return st
+	}
+	st.filtering, st.hasFiltering = filtering, true
+	if !filtering {
+		// Without filtering the bridge has no VLAN membership to publish.
+		return st
+	}
+	if !r.vlanMapFetched {
+		r.vlanMapFetched = true
+		if m, err := r.netlink.BridgeVlanList(); err != nil {
+			klog.Warningf("vfio inventory: bridge VLAN dump failed: %v", err)
+		} else {
+			r.vlanMap = m
+		}
+	}
+	if r.vlanMap == nil {
+		return st
+	}
+	link, err := r.netlink.LinkByName(uplink)
+	if err != nil {
+		return st
+	}
+	// An empty carried set is still definitive: the uplink carries nothing.
+	st.vlans = r.vlanMap[int32(link.Attrs().Index)] //nolint:gosec // ifindex is int32 in the kernel ABI
+	st.hasVlans = true
+	return st
+}
+
+// describeDevice reads the sysfs facts of one vfio-pci-bound function.
+// A nil Spec with nil error means the device is not a network controller.
+func (inv *Inventory) describeDevice(bdf string) (*Spec, error) {
+	class, err := inv.sysfs.GetPciClass(bdf)
+	if err != nil {
+		return nil, err
+	}
+	if !isNetworkClass(class) {
+		return nil, nil
+	}
+	isVf, err := inv.sysfs.IsVf(bdf)
+	if err != nil {
+		return nil, err
+	}
+
+	spec := &Spec{
+		PCIAddress: bdf,
+		Class:      class,
+		Kind:       KindPF,
+		VFIndex:    -1,
+		LinkType:   linkTypeOf(class),
+	}
+	if isVf {
+		spec.Kind = KindVF
+		pfPci, err := inv.sysfs.GetPfPci(bdf)
+		if err != nil {
+			return nil, err
+		}
+		spec.PFPCIAddress = pfPci
+		// The PF may itself be vfio-pci-bound and then has no netdev; PF
+		// pools select such VFs by PCI address instead.
+		if pfName, err := inv.sysfs.GetPfName(pfPci); err == nil {
+			spec.PFName = pfName
+		}
+		vfIndex, err := inv.sysfs.GetVfIndex(pfPci, bdf)
+		if err != nil {
+			return nil, err
+		}
+		spec.VFIndex = vfIndex
+	}
+
+	group, err := inv.sysfs.GetIOMMUGroup(bdf)
+	if err != nil {
+		// Without an IOMMU group there is no /dev/vfio/<group> to hand to
+		// the VM, so the device is unusable.
+		return nil, err
+	}
+	spec.IOMMUGroup = group
+	return spec, nil
+}
+
+func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Device {
+	device := resourceapi.Device{
+		Name: names.NormalizePCIAddress(spec.PCIAddress),
+		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			// The standard PCI address attribute is what KubeVirt's DRA
+			// hostdevice path reads (via the KEP-5304 metadata file) to
+			// build the libvirt <hostdev>.
+			deviceattribute.StandardDeviceAttributePCIBusID: {StringValue: ptr.To(spec.PCIAddress)},
+			AttrDomain + "/kind":                            {StringValue: ptr.To(spec.Kind)},
+			AttrDomain + "/linkType":                        {StringValue: ptr.To(spec.LinkType)},
+			AttrDomain + "/nodeName":                        {StringValue: ptr.To(inv.nodeName)},
+			AttrDomain + "/pciClass":                        {StringValue: ptr.To(spec.Class)},
+			AttrDomain + "/iommuGroup":                      {IntValue: ptr.To(int64(spec.IOMMUGroup))},
+			AttrDomain + "/deviceType":                      {StringValue: ptr.To("vfio-pci")},
+		},
+	}
+	if spec.PFName != "" {
+		device.Attributes[AttrDomain+"/pfName"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.PFName)}
+	}
+	if spec.PFPCIAddress != "" {
+		device.Attributes[AttrDomain+"/pfPciAddress"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.PFPCIAddress)}
+	}
+	if spec.Kind == KindVF {
+		device.Attributes[AttrDomain+"/vfIndex"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(spec.VFIndex))}
+	}
+	// Fabric identity of an InfiniBand function; absent when unknown (a CEL
+	// guard tests presence, so an empty value must never be published).
+	if spec.NodeGUID != "" {
+		device.Attributes[AttrDomain+"/nodeGUID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.NodeGUID)}
+	}
+	if spec.PortGUID != "" {
+		device.Attributes[AttrDomain+"/portGUID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.PortGUID)}
+	}
+	if spec.RDMADevice != "" {
+		device.Attributes[AttrDomain+"/rdmaDevice"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.RDMADevice)}
+	}
+	if numa, err := inv.sysfs.GetNumaNode(spec.PCIAddress); err == nil && numa >= 0 {
+		device.Attributes[AttrDomain+"/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(numa))}
+	}
+	vendor := ""
+	if v, err := inv.sysfs.GetVendorID(spec.PCIAddress); err == nil && v != "" {
+		vendor = v
+		device.Attributes[AttrDomain+"/vendor"] = resourceapi.DeviceAttribute{StringValue: ptr.To(v)}
+	}
+	if deviceID, err := inv.sysfs.GetDeviceID(spec.PCIAddress); err == nil && deviceID != "" {
+		device.Attributes[AttrDomain+"/deviceID"] = resourceapi.DeviceAttribute{StringValue: ptr.To(deviceID)}
+	}
+	device.Attributes[AttrDomain+"/rdmaCapable"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(inv.isRdmaCapable(spec, vendor))}
+	// Best effort: topology alignment hint, resolved from the live /sys.
+	if pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(spec.PCIAddress); err == nil {
+		device.Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
+	}
+	if up != nil {
+		if up.uplink != "" {
+			device.Attributes[AttrDomain+"/uplink"] = resourceapi.DeviceAttribute{StringValue: ptr.To(up.uplink)}
+		}
+		if up.bridge != "" {
+			device.Attributes[AttrDomain+"/bridge"] = resourceapi.DeviceAttribute{StringValue: ptr.To(up.bridge)}
+		}
+		if up.hasFiltering {
+			device.Attributes[AttrDomain+"/vlanFiltering"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(up.filtering)}
+		}
+		if up.hasVlans {
+			ranges, truncated := formatVlanRanges(up.vlans)
+			device.Attributes[AttrDomain+"/uplinkVlans"] = resourceapi.DeviceAttribute{StringValue: ptr.To(ranges)}
+			if truncated {
+				// Known issue, not a node fault: the carried set overflowed
+				// the 64-char DRA string value, so the published prefix is
+				// incomplete — the dropped VLANs ARE carried by the uplink.
+				// Consumers must not fail on this flag; treat membership of
+				// unlisted VIDs as unknown and continue, leaving enforcement
+				// to NodePrepareResources. Goes away once uplinkVlans can be
+				// a KEP-5491 list attribute (DRAListTypeAttributes on by
+				// default) — see formatVlanRanges.
+				device.Attributes[AttrDomain+"/uplinkVlansTruncated"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(true)}
+			}
+			// Exact comma-padded enumeration for CEL membership tests
+			// (DeviceClass selection by carried VID); the overflow escape
+			// keeps selection permissive and leaves enforcement to
+			// NodePrepareResources.
+			if exact, ok := formatVlanExact(up.vlans); ok {
+				device.Attributes[AttrDomain+"/uplinkVlansExact"] = resourceapi.DeviceAttribute{StringValue: ptr.To(exact)}
+			} else {
+				device.Attributes[AttrDomain+"/uplinkVlansExactOverflow"] = resourceapi.DeviceAttribute{BoolValue: ptr.To(true)}
+			}
+			if vid, ok := untaggedVid(up.vlans); ok {
+				device.Attributes[AttrDomain+"/untaggedVlan"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(vid))}
+			}
+		}
+	}
+	return device
+}
+
+// mellanoxVendorID is the PCI vendor id of NVIDIA/Mellanox NICs, all of which
+// are RDMA-capable.
+const mellanoxVendorID = "15b3"
+
+// isRdmaCapable reports whether the function belongs to RDMA-capable silicon.
+// The authoritative signal is an RDMA device node on the function or on its PF
+// (a pooled VF is vfio-bound, but its PF keeps the kernel driver); a whole PF
+// handed to vfio-pci exposes no node, so link type and Mellanox vendor id
+// stand in.
+func (inv *Inventory) isRdmaCapable(spec *Spec, vendor string) bool {
+	if ok, err := inv.sysfs.HasInfinibandDevice(spec.PCIAddress); err == nil && ok {
+		return true
+	}
+	if spec.PFPCIAddress != "" {
+		if ok, err := inv.sysfs.HasInfinibandDevice(spec.PFPCIAddress); err == nil && ok {
+			return true
+		}
+	}
+	return spec.LinkType == LinkTypeInfiniband || vendor == mellanoxVendorID
+}
+
+func linkTypeOf(class string) string {
+	switch {
+	case isEthernetClass(class):
+		return LinkTypeEthernet
+	case isInfiniBandClass(class):
+		return LinkTypeInfiniband
+	default:
+		return LinkTypeOther
+	}
+}
+
+// GetResources returns the channel the publisher consumes device lists from.
+func (inv *Inventory) GetResources(_ context.Context) <-chan []resourceapi.Device {
+	return inv.notifications
+}
+
+// GetDevice returns the published device by name.
+func (inv *Inventory) GetDevice(deviceName string) (resourceapi.Device, bool) {
+	inv.mu.RLock()
+	defer inv.mu.RUnlock()
+	dev, ok := inv.devices[deviceName]
+	return dev, ok
+}
+
+// GetVfioSpec returns the sysfs facts of a published device.
+func (inv *Inventory) GetVfioSpec(deviceName string) (Spec, bool) {
+	inv.mu.RLock()
+	defer inv.mu.RUnlock()
+	spec, ok := inv.specs[deviceName]
+	return spec, ok
+}
+
+// GetNetInterfaceName never resolves: a vfio-pci-bound device has no
+// kernel netdev.
+func (inv *Inventory) GetNetInterfaceName(deviceName string) (string, error) {
+	return "", fmt.Errorf("device %s is vfio-pci-bound and has no netdev", deviceName)
+}
+
+// IsIBOnlyDevice is always false: even InfiniBand devices are handled by
+// the vfio path, not the RDMA one.
+func (inv *Inventory) IsIBOnlyDevice(_ string) bool {
+	return false
+}
+
+// GetRDMADeviceName never resolves: a vfio-pci-bound device exposes no
+// host RDMA device.
+func (inv *Inventory) GetRDMADeviceName(deviceName string) (string, error) {
+	return "", fmt.Errorf("device %s has no RDMA device", deviceName)
+}
+
+// GetDeviceConfig returns no provider-side configuration.
+func (inv *Inventory) GetDeviceConfig(_ string) (*apis.NetworkConfig, bool) {
+	return nil, false
+}
+
+// RequestRescan triggers an immediate hardware rescan and republish check.
+func (inv *Inventory) RequestRescan() {
+	select {
+	case inv.rescan <- struct{}{}:
+	default:
+	}
+}
+
+// GetProfileConfig is not supported; profiles must not be requested.
+func (inv *Inventory) GetProfileConfig(deviceName string, _ *resourceapi.ResourceClaim, _ *apis.NetworkConfig) (*apis.NetworkConfig, error) {
+	return nil, fmt.Errorf("profiles are not supported (device %s)", deviceName)
+}
+
+// ReleaseProfileConfig is a no-op as profiles are not supported.
+func (inv *Inventory) ReleaseProfileConfig(_ string, _ types.UID, _ *apis.NetworkConfig) error {
+	return nil
+}
+
+// String renders the inventory state for debug logging.
+func (inv *Inventory) String() string {
+	inv.mu.RLock()
+	defer inv.mu.RUnlock()
+	names := make([]string, 0, len(inv.devices))
+	for name := range inv.devices {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}

@@ -1,0 +1,36 @@
+# Select one specific InfiniBand function by its fabric identity: the
+# vfio.petasus.io/portGUID attribute (16 hex digits) dranet-vfio publishes
+# from the PF netdev (VF) or from sriov-daemon's GUID record (whole PF).
+# Every attribute read keeps an `"attr" in ...` guard — reading an absent
+# attribute aborts the whole allocation instead of skipping the device.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: ib-3825f30300928354.petasus.io
+spec:
+  selectors:
+    - cel:
+        expression: |-
+          device.driver == "vfio.petasus.io" &&
+          "linkType" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].linkType == "infiniband" &&
+          "portGUID" in device.attributes["vfio.petasus.io"] &&
+          device.attributes["vfio.petasus.io"].portGUID == "3825f30300928354"
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: ib-by-guid
+spec:
+  devices:
+    requests:
+      - name: nic
+        exactly:
+          deviceClassName: ib-3825f30300928354.petasus.io
+          allocationMode: ExactCount
+          count: 1
+    config:
+      - requests: [nic]
+        opaque:
+          driver: vfio.petasus.io
+          parameters: {}
