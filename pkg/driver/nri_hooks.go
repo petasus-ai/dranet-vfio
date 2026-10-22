@@ -172,6 +172,7 @@ func (np *NetworkDriver) runPodSandbox(ctx context.Context, pod *api.PodSandbox,
 			WithDevice(deviceName).
 			WithDriver(np.driverName).
 			WithPool(np.nodeName)
+		np.carryDeviceStatus(config, resourceClaimStatusDevice)
 
 		ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 

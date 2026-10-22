@@ -81,7 +81,7 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 
 			resources := resourceslice.DriverResources{
 				Pools: map[string]resourceslice.Pool{
-					np.nodeName: {Slices: []resourceslice.Slice{{Devices: filtered}}},
+					np.nodeName: {Slices: carrySlices(filtered)},
 				},
 			}
 			err := np.draPlugin.PublishResources(ctx, resources)
@@ -192,6 +192,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 	}
 
 	var errorList []error
+	var carried carryClaim
 	for _, result := range claim.Status.Allocation.Devices.Results {
 		// A single ResourceClaim can have devices managed by distinct DRA
 		// drivers. One common use case for this is device topology alignment
@@ -203,7 +204,18 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		if result.Driver != np.driverName {
 			continue
 		}
+		if handled, err := np.prepareCarryDevice(ctx, claim, podUID, result, &carried); handled {
+			if err != nil {
+				errorList = append(errorList, err)
+			}
+			continue
+		}
 		if err := np.prepareDevice(ctx, nlHandle, claim, podUID, result, rulesByTable); err != nil {
+			errorList = append(errorList, err)
+		}
+	}
+	if len(errorList) == 0 {
+		if err := np.finishCarryClaim(claim, &carried); err != nil {
 			errorList = append(errorList, err)
 		}
 	}
@@ -216,7 +228,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			Err: fmt.Errorf("claim %s contain errors: %w", claim.UID, joinedErr),
 		}
 	}
-	return kubeletplugin.PrepareResult{}
+	return kubeletplugin.PrepareResult{Devices: carried.devices}
 }
 
 // prepareDevice resolves, validates, and persists the configuration of an allocated
@@ -587,6 +599,9 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 			}
 		}
 	}
+	if err := np.unprepareCarryClaim(claim); err != nil {
+		return err
+	}
 
 	_, err := np.podConfigStore.DeleteClaim(claim.NamespacedName)
 	return err
@@ -601,10 +616,9 @@ func (np *NetworkDriver) HandleError(ctx context.Context, err error, msg string)
 // WatchHealthStatus implements the DRAPlugin contract, which requires this
 // method as of Kubernetes 1.37:
 // https://github.com/kubernetes/kubernetes/pull/139477
-// DRANET disables the optional health service, so this method is not called.
 // TODO: This function should be implemented as part of https://github.com/kubernetes-sigs/dranet/issues/293
-func (np *NetworkDriver) WatchHealthStatus(context.Context, chan<- kubeletplugin.DeviceHealthReport) error {
-	return kubeletplugin.ErrHealthNotSupported
+func (np *NetworkDriver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
+	return np.watchCarryHealth(ctx, reports)
 }
 
 func formatDeviceNames(devices []resourceapi.Device, max int) string {
