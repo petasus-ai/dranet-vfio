@@ -1,3 +1,128 @@
+# dranet-vfio
+
+DRA driver (fork of [kubernetes-sigs/dranet](https://github.com/kubernetes-sigs/dranet))
+that gives KubeVirt VMs VFIO-PCI passthrough NICs — Ethernet and InfiniBand,
+PF and VF alike — allocated through `resource.k8s.io/v1`. No CNI, no Multus,
+no device plugin.
+
+Driver name: `vfio.petasus.io`.
+
+## How it works
+
+- Hardware is discovered from sysfs: every PCI function bound to `vfio-pci`
+  whose class is a network controller (`0x02xx`/`0x0c06xx`) is published —
+  a vfio-pci binding already means passthrough intent. There is no driver
+  configuration; selection policy lives entirely in DeviceClass CEL over the
+  published attributes.
+
+  Each device is published as a ResourceSlice device `pci-<bdf>` with the
+  standard `resource.kubernetes.io/pciBusID` attribute and
+  `vfio.petasus.io/{nodeName,kind,linkType,vendor,deviceID,pfName,pfPciAddress,vfIndex,iommuGroup,pciClass,numaNode,deviceType,rdmaCapable}`
+  (`nodeName` is the node the slice is published for, so a DeviceClass CEL
+  can select a parent PF per node — CEL sees device attributes only)
+  (plus, on InfiniBand functions, the fabric identity `nodeGUID`/`portGUID`
+  as 16 hex digits — a VF's from the administrative GUIDs its PF netdev
+  reports over rtnetlink, a whole PF's from sriov-daemon's record
+  `/var/lib/petasus/ib-guids.json` (`--ib-guid-file`, mounted read-only),
+  which also backs a VF whose PF reports zeros, and, on a whole PF, the
+  record's `ibdev` as `rdmaDevice` — the RDMA device name the PF exposed
+  before it was bound; unknown = attribute absent;
+  plus the uplink VLAN snapshot on Ethernet VFs whose PF keeps a netdev:
+  `uplink,bridge,vlanFiltering,uplinkVlans,untaggedVlan`, and
+  `uplinkVlansExact` — a comma-padded full VID enumeration for CEL
+  `contains(",<vid>,")` membership tests, with `uplinkVlansExactOverflow`
+  as the permissive escape when the set exceeds the 64-char attribute cap).
+  The host is rescanned periodically (`--rescan-interval`), so newly bound
+  devices need no driver restart. Functions that share an IOMMU group with
+  another vfio-bound function consume that group's single shared counter
+  (counter set `iommu-group-<N>`), so the scheduler never splits a VFIO group
+  across claims.
+
+- On `NodePrepareResources` the driver validates the device (vfio-pci
+  binding, network PCI class, IOMMU-group viability) and applies the claim's
+  VF settings on the host — the behavior of the sriov-vfio CNI, absorbed:
+
+  - **Ethernet VF, legacy eswitch:** MAC (with read-back verification) and
+    VLAN via the PF; link state auto.
+  - **Ethernet VF, switchdev eswitch:** the VF representor is attached to
+    the bridge over the uplink (PF or its bond), with MTU inheritance,
+    access-VLAN programming validated against the uplink's bridge-port
+    membership (the representor keeps no other VLAN, or prepare fails), and
+    per-bridge flock serialization.
+  - **Everything else** (Ethernet PF, InfiniBand PF/VF): pure passthrough,
+    no host configuration; any VF option in the claim fails prepare.
+
+  Original VF settings are captured first and restored on
+  `NodeUnprepareResources`, surviving driver restarts (bbolt, `--db-path`).
+
+- Prepare returns one CDI device per vfio device (spec
+  `/var/run/cdi/vfio.petasus.io_<claim UID>.json`, `--cdi-dir`) carrying
+  `/dev/vfio/vfio` and `/dev/vfio/<iommu group>` owned by uid/gid 107 (qemu
+  in virt-launcher), plus the device's attributes as KEP-5304 device
+  metadata: the kubeletplugin helper writes the metadata file (a
+  `v1beta1` + `v1alpha1` stream) and a CDI spec that bind-mounts it at
+  `/var/run/kubernetes.io/dra-device-attributes/resourceclaims/<claim>/<request>/vfio.petasus.io-metadata.json`,
+  where KubeVirt's DRA path reads `resource.kubernetes.io/pciBusID` to build
+  the libvirt `<hostdev>`; a claim whose metadata the helper could not write
+  fails prepare, so kubelet retries it. Kubelet injects the CDI devices into
+  the containers that reference the claim, also for a pod that reuses a claim
+  already prepared on the node (a replacement launcher while the old sandbox
+  still exists).
+
+- VF settings arrive per claim via the opaque device config:
+
+  ```yaml
+  config:
+    - requests: ["nic"]
+      opaque:
+        driver: vfio.petasus.io
+        parameters:
+          mac: "02:00:00:aa:bb:cc"   # omitted for InfiniBand
+          vlan: 1234                 # network segment ID; 0/omitted = untagged
+  ```
+
+  Any other key fails prepare.
+
+KubeVirt consumes the device with `interfaces[].sriov: {}` and
+`spec.networks[].resourceClaim` (`NetworkDevicesWithDRA` feature gate); the
+PCI address flows through the metadata file, not a network-status
+annotation.
+
+## Deploy
+
+Production installs the edgespray chart `deployments/dranet-vfio`.
+`deployments/helm/dranet` is upstream's chart for upstream dranet (`dra.net`).
+`deployments/examples/` shows DeviceClasses for SR-IOV and InfiniBand pools.
+
+## Fork layout
+
+The fork follows upstream `main`; the commits on top of it are the whole
+difference, kept small so a sync is a plain rebase:
+
+- `pkg/vfio/**`: inventory, VF configuration, CDI specs.
+- `pkg/driver/carry.go`, `pkg/driver/vfiodevice.go`: the driver additions.
+  Upstream files call them through one-line hooks and embed `carryState` /
+  `CarryDeviceConfig`; apart from the per-claim `DeleteClaim` fix in
+  `pod_device_config*.go`, nothing else in `pkg/driver` differs from upstream.
+- `cmd/dranet-vfio`: the entry point (`cmd/dranet` stays upstream's).
+- `Dockerfile.petasus`, `.github/workflows/build-push.yaml`: the image
+  `quay.io/edgestack/dranet-vfio` (`main` → `dev`, `v*` tags, `latest` for the newest
+  final release tag, and a `sync/*` branch → its slug). Upstream's own workflows are
+  disabled in this repository.
+
+Releases reuse upstream's newest release tag name: `vX.Y.Z` here is upstream's latest
+release name on this fork's `main` (upstream `main` plus the commits above), and a
+re-release moves it. The fork keeps no upstream branch or tag, so fetch upstream without
+tags (`git config remote.upstream.tagOpt --no-tags`).
+
+To sync: `git fetch --no-tags upstream main`, then
+`git rebase --onto upstream/main <previous upstream base> main`; conflicts
+can only come from the hook lines.
+
+The upstream dranet documentation below describes the inherited machinery.
+
+---
+
 # DRANET: DRA Kubernetes Network Driver
 
 DRANET is a Kubernetes Network Driver that uses Dynamic Resource Allocation
