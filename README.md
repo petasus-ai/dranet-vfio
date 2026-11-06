@@ -79,6 +79,7 @@ Driver name: `vfio.petasus.io`.
         parameters:
           mac: "02:00:00:aa:bb:cc"   # omitted for InfiniBand
           vlan: 1234                 # network segment ID; 0/omitted = untagged
+          maxTxRate: 1000            # VF transmit cap, Mbit/s, as the PF rounds it; 0/omitted = uncapped
   ```
 
   Any other key fails prepare.

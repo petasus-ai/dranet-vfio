@@ -42,6 +42,7 @@ type NetlinkOps interface {
 	LinkSetVfHardwareAddr(link netlink.Link, vf int, addr net.HardwareAddr) error
 	LinkSetVfVlan(link netlink.Link, vf int, vlan int) error
 	LinkSetVfState(link netlink.Link, vf int, state uint32) error
+	LinkSetVfRate(link netlink.Link, vf, minRate, maxRate int) error
 
 	// Bridge VLAN operations
 	BridgeVlanAdd(link netlink.Link, vid uint16, pvid, untagged, self, master bool) error
@@ -70,6 +71,8 @@ type VfInfo struct {
 	Mac       net.HardwareAddr
 	Vlan      int
 	LinkState uint32
+	MinTxRate int // Mbit/s, 0 = none
+	MaxTxRate int // Mbit/s, 0 = none
 }
 
 // NewNetlink returns the real netlink implementation.
@@ -99,6 +102,10 @@ func (o *realNetlink) LinkSetVfVlan(link netlink.Link, vf, vlan int) error {
 
 func (o *realNetlink) LinkSetVfState(link netlink.Link, vf int, state uint32) error {
 	return netlink.LinkSetVfState(link, vf, state)
+}
+
+func (o *realNetlink) LinkSetVfRate(link netlink.Link, vf, minRate, maxRate int) error {
+	return netlink.LinkSetVfRate(link, vf, minRate, maxRate)
 }
 
 func (o *realNetlink) BridgeVlanAdd(link netlink.Link, vid uint16, pvid, untagged, self, master bool) error {
@@ -147,6 +154,8 @@ func (o *realNetlink) LinkGetVfInfo(pfName string, vf int) (*VfInfo, error) {
 		Mac:       vi.Mac,
 		Vlan:      vi.Vlan,
 		LinkState: vi.LinkState,
+		MinTxRate: int(vi.MinTxRate),
+		MaxTxRate: int(vi.MaxTxRate),
 	}
 	return info, nil
 }

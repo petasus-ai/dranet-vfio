@@ -112,6 +112,11 @@ func TestParseClaimParamsValidation(t *testing.T) {
 		{"negative vlan", `{"vlan":-1}`, "VLAN ID must be 0-4094"},
 		{"removed option", `{"spoofchk":"off"}`, "unknown field"},
 		{"vlan 0", `{"vlan":0}`, ""},
+		{"rate", `{"maxTxRate":1000}`, ""},
+		{"rate 0", `{"maxTxRate":0}`, ""},
+		{"negative rate", `{"maxTxRate":-1}`, "maxTxRate must be 0-2147483647"},
+		{"rate overflow", `{"maxTxRate":2147483648}`, "maxTxRate must be 0-2147483647"},
+		{"fractional rate", `{"maxTxRate":1.5}`, "cannot unmarshal"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

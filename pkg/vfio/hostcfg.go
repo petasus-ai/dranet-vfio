@@ -304,6 +304,14 @@ func (c *Configurer) applyLegacy(state *HostState, params *ClaimParams) error {
 		rollback.run()
 		return fmt.Errorf("failed to set VLAN: %w", err)
 	}
+	rollback.push(func() {
+		_ = c.netlink.LinkSetVfVlan(pfLink, state.VfIndex, state.OrigVlan)
+	})
+
+	if err := c.setVfRate(pfLink, state, params, &rollback); err != nil {
+		rollback.run()
+		return err
+	}
 
 	// Link state = auto (always). Not every driver implements
 	// ndo_set_vf_link_state — rtnetlink returns -EOPNOTSUPP when it is
@@ -333,6 +341,37 @@ func (c *Configurer) setVfMAC(pfLink netlink.Link, state *HostState, params *Cla
 	}
 	if vfInfo.Mac.String() != mac.String() {
 		return fmt.Errorf("admin MAC not applied: expected %s, got %s", mac, vfInfo.Mac)
+	}
+	return nil
+}
+
+// setVfRate applies the claim's cap via the PF; without one the VF runs
+// uncapped, whatever an earlier claim set.
+func (c *Configurer) setVfRate(pfLink netlink.Link, state *HostState, params *ClaimParams, rollback *rollbackStack) error {
+	if params.MaxTxRate == nil || *params.MaxTxRate == 0 {
+		return c.clearVfRate(pfLink, state)
+	}
+	// Registered first: a driver can commit the minimum and fail on the maximum.
+	rollback.push(func() { _ = c.clearVfRate(pfLink, state) })
+	if err := c.netlink.LinkSetVfRate(pfLink, state.VfIndex, 0, *params.MaxTxRate); err != nil {
+		return fmt.Errorf("failed to set the rate of VF %d on PF %s to max %d Mbit/s: %w",
+			state.VfIndex, state.PfName, *params.MaxTxRate, err)
+	}
+	return nil
+}
+
+// clearVfRate skips the setter when both rates are zero, so a PF without
+// rate support takes uncapped claims.
+func (c *Configurer) clearVfRate(pfLink netlink.Link, state *HostState) error {
+	vfInfo, err := c.netlink.LinkGetVfInfo(state.PfName, state.VfIndex)
+	if err != nil {
+		return fmt.Errorf("read VF rate: %w", err)
+	}
+	if vfInfo.MinTxRate == 0 && vfInfo.MaxTxRate == 0 {
+		return nil
+	}
+	if err := c.netlink.LinkSetVfRate(pfLink, state.VfIndex, 0, 0); err != nil {
+		return fmt.Errorf("clear rate: %w", err)
 	}
 	return nil
 }
@@ -465,6 +504,11 @@ func (c *Configurer) applySwitchdev(state *HostState, params *ClaimParams) error
 			rollback.run()
 			return err
 		}
+	}
+
+	if err := c.setVfRate(pfLink, state, params, &rollback); err != nil {
+		rollback.run()
+		return err
 	}
 
 	if err := c.netlink.LinkSetUp(repLink); err != nil {
@@ -728,6 +772,9 @@ func (c *Configurer) restoreLegacy(state *HostState) []error {
 	if err := c.netlink.LinkSetVfState(pfLink, state.VfIndex, state.OrigLinkState); err != nil {
 		errs = append(errs, fmt.Errorf("restore link state: %w", err))
 	}
+	if err := c.clearVfRate(pfLink, state); err != nil {
+		errs = append(errs, err)
+	}
 	return errs
 }
 
@@ -735,8 +782,8 @@ func (c *Configurer) restoreLegacy(state *HostState) []error {
 func (c *Configurer) restoreSwitchdev(state *HostState) []error {
 	var errs []error
 
-	// Restore the admin MAC via the PF; VLAN and link state are legacy-only
-	// VF settings.
+	// Restore the admin MAC and clear the rate via the PF; VLAN and link
+	// state are legacy-only VF settings.
 	if state.PfName == "" {
 		errs = append(errs, fmt.Errorf("recorded state has no PF name, skipping VF reset"))
 	} else if pfLink, err := c.netlink.LinkByName(state.PfName); err != nil {
@@ -744,6 +791,9 @@ func (c *Configurer) restoreSwitchdev(state *HostState) []error {
 	} else {
 		if err := c.netlink.LinkSetVfHardwareAddr(pfLink, state.VfIndex, origMAC(state)); err != nil {
 			errs = append(errs, fmt.Errorf("restore MAC: %w", err))
+		}
+		if err := c.clearVfRate(pfLink, state); err != nil {
+			errs = append(errs, err)
 		}
 	}
 

@@ -20,14 +20,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/dynamic-resource-allocation/resourceclaim"
 )
 
-// ClaimParams is the flat opaque-config schema of this driver. Both fields
-// apply to Ethernet SR-IOV VFs only; setting either for a passthrough device
+// ClaimParams is the flat opaque-config schema of this driver. Every field
+// applies to Ethernet SR-IOV VFs only; setting one for a passthrough device
 // (Ethernet PF, any InfiniBand device) fails prepare.
 type ClaimParams struct {
 	// MAC is the VF admin MAC, set via the PF.
@@ -37,6 +38,10 @@ type ClaimParams struct {
 	// legacy mode, resolved to the uplink's egress-untagged VID in
 	// switchdev mode.
 	Vlan *int `json:"vlan,omitempty"`
+
+	// MaxTxRate is the VF transmit cap in Mbit/s, set via the PF, which may
+	// round it to its rate granularity. 0 (or omitted) runs the VF uncapped.
+	MaxTxRate *int `json:"maxTxRate,omitempty"`
 }
 
 // setFields names the parameters that are set, for error messages.
@@ -47,6 +52,9 @@ func (p *ClaimParams) setFields() []string {
 	}
 	if p.Vlan != nil {
 		set = append(set, "vlan")
+	}
+	if p.MaxTxRate != nil {
+		set = append(set, "maxTxRate")
 	}
 	return set
 }
@@ -94,6 +102,10 @@ func (p *ClaimParams) validate() error {
 	// 4095 is reserved and 0 means "no VLAN" (IEEE 802.1Q).
 	if p.Vlan != nil && (*p.Vlan < 0 || *p.Vlan > 4094) {
 		return fmt.Errorf("VLAN ID must be 0-4094, got %d", *p.Vlan)
+	}
+	// The kernel passes a VF rate to the driver as a signed int.
+	if p.MaxTxRate != nil && (*p.MaxTxRate < 0 || *p.MaxTxRate > math.MaxInt32) {
+		return fmt.Errorf("maxTxRate must be 0-%d Mbit/s, got %d", math.MaxInt32, *p.MaxTxRate)
 	}
 	return nil
 }

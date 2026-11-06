@@ -206,6 +206,25 @@ func (f *fakeNetlink) LinkSetVfVlan(link netlink.Link, vf, vlan int) error {
 func (f *fakeNetlink) LinkSetVfState(link netlink.Link, vf int, state uint32) error {
 	return f.record(fmt.Sprintf("vf-state %s %d %d", link.Attrs().Name, vf, state))
 }
+func (f *fakeNetlink) LinkSetVfRate(link netlink.Link, vf, minRate, maxRate int) error {
+	err := f.record(fmt.Sprintf("vf-rate %s %d %d %d", link.Attrs().Name, vf, minRate, maxRate))
+	if err == nil {
+		info := f.vfInfo[link.Attrs().Name][vf]
+		info.MinTxRate, info.MaxTxRate = minRate, maxRate
+	}
+	return err
+}
+
+// rateCalls are the VF rate calls made, in order.
+func (f *fakeNetlink) rateCalls() []string {
+	var out []string
+	for _, call := range f.calls {
+		if strings.HasPrefix(call, "vf-rate ") {
+			out = append(out, call)
+		}
+	}
+	return out
+}
 
 // BridgeVlanAdd adds or updates the port's VLAN; a new PVID replaces the old
 // one (br_vlan.c:__vlan_add_pvid).
@@ -371,6 +390,75 @@ func TestApplyLegacyRollbackOnFailure(t *testing.T) {
 	nlops.hasCall(t, "vf-mac enp8s0f0 3 aa:bb:cc:dd:ee:03")
 }
 
+func TestApplyLegacyRate(t *testing.T) {
+	_, nlops, configurer := legacyFixture()
+	state, err := planAndApply(configurer, Spec{PCIAddress: testVF}, &ClaimParams{MaxTxRate: ptr.To(1000)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// After the VLAN, before the link state.
+	if got, want := nlops.calls[len(nlops.calls)-3:], []string{"vf-vlan enp8s0f0 3 0", "vf-rate enp8s0f0 3 0 1000",
+		"vf-state enp8s0f0 3 0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	nlops.calls = nil
+	if errs := configurer.Restore(state); len(errs) > 0 {
+		t.Fatalf("restore errors: %v", errs)
+	}
+	if got, want := nlops.rateCalls(), []string{"vf-rate enp8s0f0 3 0 0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("restore rate calls = %v, want %v", got, want)
+	}
+}
+
+func TestAnUncappedVFSeesNoRateCall(t *testing.T) {
+	_, nlops, configurer := legacyFixture()
+	state, err := planAndApply(configurer, Spec{PCIAddress: testVF}, &ClaimParams{MaxTxRate: ptr.To(0)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs := configurer.Restore(state); len(errs) > 0 {
+		t.Fatalf("restore errors: %v", errs)
+	}
+	if len(nlops.rateCalls()) > 0 {
+		t.Fatalf("rate touched: %v", nlops.rateCalls())
+	}
+}
+
+func TestApplyLegacyRateRollbackOnFailure(t *testing.T) {
+	_, nlops, configurer := legacyFixture()
+	nlops.vfInfo["enp8s0f0"][3].MaxTxRate = 300
+	nlops.failOn["vf-rate enp8s0f0 3 0 1000"] = fmt.Errorf("EINVAL")
+	params := &ClaimParams{MAC: "02:00:00:aa:bb:cc", Vlan: ptr.To(100), MaxTxRate: ptr.To(1000)}
+	_, err := planAndApply(configurer, Spec{PCIAddress: testVF}, params, nil)
+	if err == nil || !strings.Contains(err.Error(), "failed to set the rate of VF 3 on PF enp8s0f0") {
+		t.Fatalf("expected rate error, got %v", err)
+	}
+	nlops.hasCall(t, "vf-vlan enp8s0f0 3 7")
+	nlops.hasCall(t, "vf-mac enp8s0f0 3 aa:bb:cc:dd:ee:03")
+	// The failed setter may have changed the rate: the rollback clears it.
+	if got, want := nlops.rateCalls(), []string{"vf-rate enp8s0f0 3 0 1000", "vf-rate enp8s0f0 3 0 0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("rate calls = %v, want %v", got, want)
+	}
+}
+
+// A cap an earlier claim left on the VF goes with the next prepare without a
+// cap, and with the unprepare of whichever claim is the VF's last owner.
+func TestACapAnotherClaimLeftIsCleared(t *testing.T) {
+	_, nlops, configurer := legacyFixture()
+	nlops.vfInfo["enp8s0f0"][3].MaxTxRate = 500
+	state, err := planAndApply(configurer, Spec{PCIAddress: testVF}, &ClaimParams{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nlops.vfInfo["enp8s0f0"][3].MaxTxRate = 700
+	if errs := configurer.Restore(state); len(errs) > 0 {
+		t.Fatalf("restore errors: %v", errs)
+	}
+	if got, want := nlops.rateCalls(), []string{"vf-rate enp8s0f0 3 0 0", "vf-rate enp8s0f0 3 0 0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("rate calls = %v, want %v", got, want)
+	}
+}
+
 func TestApplyPriorStateReused(t *testing.T) {
 	_, nlops, configurer := legacyFixture()
 	prior := &HostState{
@@ -434,9 +522,11 @@ func TestApplyPassthrough(t *testing.T) {
 	}
 
 	// Any VF option on a passthrough device fails prepare.
-	_, err = planAndApply(configurer, Spec{PCIAddress: "0000:0c:00.2"}, &ClaimParams{MAC: "02:00:00:aa:bb:cc"}, nil)
-	if err == nil || !strings.Contains(err.Error(), "handed through without host-side configuration") {
-		t.Fatalf("expected passthrough option rejection, got %v", err)
+	for _, params := range []*ClaimParams{{MAC: "02:00:00:aa:bb:cc"}, {MaxTxRate: ptr.To(1000)}} {
+		_, err = planAndApply(configurer, Spec{PCIAddress: "0000:0c:00.2"}, params, nil)
+		if err == nil || !strings.Contains(err.Error(), "handed through without host-side configuration") {
+			t.Fatalf("expected passthrough option rejection, got %v", err)
+		}
 	}
 }
 
@@ -495,6 +585,9 @@ func TestApplySwitchdev(t *testing.T) {
 	nlops.hasCall(t, "vlan-add enp8s0f0r3 100 pvid=true untagged=true")
 	nlops.hasCall(t, "vlan-del enp8s0f0r3 1") // default PVID removed
 	nlops.hasCall(t, "up enp8s0f0r3")
+	if len(nlops.rateCalls()) > 0 {
+		t.Fatalf("rate touched without a cap: %v", nlops.rateCalls())
+	}
 	if got, want := nlops.portVlans(20), []string{"100:pvid:untagged"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("representor VLANs = %v, want %v", got, want)
 	}
@@ -583,6 +676,33 @@ func TestPlanChangesNothing(t *testing.T) {
 		if state.OrigMAC != "aa:bb:cc:dd:ee:03" || state.Vlan != 100 {
 			t.Errorf("%s: plan %#v lacks the originals or the target VLAN", name, state)
 		}
+	}
+}
+
+func TestApplySwitchdevRate(t *testing.T) {
+	_, nlops, configurer := switchdevFixture()
+	state, err := planAndApply(configurer, Spec{PCIAddress: testVF},
+		&ClaimParams{Vlan: ptr.To(100), MaxTxRate: ptr.To(1000)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Capped before the representor carries traffic.
+	if got, want := nlops.calls[len(nlops.calls)-2:], []string{"vf-rate enp8s0f0np0 3 0 1000", "up enp8s0f0r3"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	nlops.calls = nil
+	if errs := configurer.Restore(state); len(errs) > 0 {
+		t.Fatalf("restore errors: %v", errs)
+	}
+	nlops.hasCall(t, "vf-rate enp8s0f0np0 3 0 0")
+
+	_, nlops, configurer = switchdevFixture()
+	nlops.failOn["up enp8s0f0r3"] = fmt.Errorf("EIO")
+	if _, err := planAndApply(configurer, Spec{PCIAddress: testVF}, &ClaimParams{MaxTxRate: ptr.To(1000)}, nil); err == nil {
+		t.Fatal("expected error")
+	}
+	if got, want := nlops.rateCalls(), []string{"vf-rate enp8s0f0np0 3 0 1000", "vf-rate enp8s0f0np0 3 0 0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("rate calls on a failed prepare = %v, want %v", got, want)
 	}
 }
 
