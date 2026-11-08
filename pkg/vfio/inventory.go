@@ -75,6 +75,9 @@ type Spec struct {
 	// RDMADevice is the RDMA device a whole InfiniBand PF exposed before it
 	// was bound to vfio-pci (from sriov-daemon's record); empty when unknown.
 	RDMADevice string
+	// PFLinkSpeedMbps is the link speed of a VF's parent PF netdev, the line
+	// rate the VF shares with its siblings; 0 when unknown.
+	PFLinkSpeedMbps int
 }
 
 // Inventory publishes every vfio-pci-bound network PCI function as a DRA
@@ -211,6 +214,7 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 	// serves every PF.
 	uplinks := uplinkResolver{netlink: inv.netlink, sysfs: inv.sysfs, states: map[string]*uplinkState{}}
 	guids := guidResolver{netlink: inv.netlink, record: inv.ibGuids}
+	speeds := linkSpeedResolver{sysfs: inv.sysfs, speeds: map[string]int{}}
 
 	for _, bdf := range bdfs {
 		spec, err := inv.describeDevice(bdf)
@@ -231,6 +235,7 @@ func (inv *Inventory) buildDevices() ([]resourceapi.Device, map[string]Spec) {
 			up = uplinks.stateFor(spec.PFName)
 		}
 		spec.NodeGUID, spec.PortGUID, spec.RDMADevice = guids.resolve(spec)
+		spec.PFLinkSpeedMbps = speeds.resolve(spec)
 
 		device := inv.buildDevice(spec, up)
 		devices = append(devices, device)
@@ -378,6 +383,34 @@ func (r *uplinkResolver) stateFor(pfName string) *uplinkState {
 	return st
 }
 
+// linkSpeedResolver memoizes each PF's link speed within one sync pass: every
+// read takes the RTNL lock and asks the PF driver.
+type linkSpeedResolver struct {
+	sysfs  SysfsOps
+	speeds map[string]int
+}
+
+// resolve returns the link speed in Mb/s of a VF's parent PF netdev, 0 when
+// unknown: a whole PF, a PF without a netdev, a failed read, or no link.
+func (r *linkSpeedResolver) resolve(spec *Spec) int {
+	if spec.Kind != KindVF || spec.PFName == "" {
+		return 0
+	}
+	if speed, ok := r.speeds[spec.PFPCIAddress]; ok {
+		return speed
+	}
+	speed, err := r.sysfs.GetPfLinkSpeed(spec.PFPCIAddress, spec.PFName)
+	switch {
+	case err != nil:
+		klog.V(4).Infof("vfio inventory: no link speed for PF %s: %v", spec.PFName, err)
+		speed = 0
+	case speed < 0:
+		speed = 0
+	}
+	r.speeds[spec.PFPCIAddress] = speed
+	return speed
+}
+
 // describeDevice reads the sysfs facts of one vfio-pci-bound function.
 // A nil Spec with nil error means the device is not a network controller.
 func (inv *Inventory) describeDevice(bdf string) (*Spec, error) {
@@ -453,6 +486,9 @@ func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Devic
 	}
 	if spec.Kind == KindVF {
 		device.Attributes[AttrDomain+"/vfIndex"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(spec.VFIndex))}
+	}
+	if spec.PFLinkSpeedMbps > 0 {
+		device.Attributes[AttrDomain+"/pfLinkSpeedMbps"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(spec.PFLinkSpeedMbps))}
 	}
 	// Fabric identity of an InfiniBand function; absent when unknown (a CEL
 	// guard tests presence, so an empty value must never be published).

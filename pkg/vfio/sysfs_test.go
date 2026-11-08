@@ -96,6 +96,12 @@ func (b *sysfsBuilder) netdev(pfBdf, name, physPortName string) {
 	b.writeFile(physPortName, "class/net", name, "phys_port_name")
 }
 
+// linkSpeed writes a PF netdev's speed file as the kernel reports it (Mb/s,
+// -1 without link).
+func (b *sysfsBuilder) linkSpeed(pfBdf, name, speed string) {
+	b.writeFile(speed, "bus/pci/devices", pfBdf, "net", name, "speed")
+}
+
 func TestListVFIODevices(t *testing.T) {
 	b := newSysfsBuilder(t)
 	b.device("0000:08:00.2", "0x020000", "vfio-pci", "42")
@@ -207,6 +213,33 @@ func TestGetPfName(t *testing.T) {
 				t.Fatalf("expected %q, got %q, %v", tc.want, got, err)
 			}
 		})
+	}
+}
+
+func TestGetPfLinkSpeed(t *testing.T) {
+	b := newSysfsBuilder(t)
+	b.device("0000:08:00.0", "0x020000", "mlx5_core", "")
+	b.netdev("0000:08:00.0", "enp8s0f0np0", "p0")
+	b.linkSpeed("0000:08:00.0", "enp8s0f0np0", "400000")
+	b.device("0000:08:00.1", "0x020000", "mlx5_core", "")
+	b.netdev("0000:08:00.1", "enp8s0f1np1", "p1")
+	b.linkSpeed("0000:08:00.1", "enp8s0f1np1", "-1")
+	b.device("0000:09:00.0", "0x020000", "mlx5_core", "")
+	b.netdev("0000:09:00.0", "enp9s0f0np0", "p0")
+	b.linkSpeed("0000:09:00.0", "enp9s0f0np0", "unknown")
+	ops := b.ops()
+
+	if speed, err := ops.GetPfLinkSpeed("0000:08:00.0", "enp8s0f0np0"); err != nil || speed != 400000 {
+		t.Fatalf("expected 400000, got %d, %v", speed, err)
+	}
+	if speed, err := ops.GetPfLinkSpeed("0000:08:00.1", "enp8s0f1np1"); err != nil || speed != -1 {
+		t.Fatalf("expected the kernel's -1 without link, got %d, %v", speed, err)
+	}
+	if _, err := ops.GetPfLinkSpeed("0000:09:00.0", "enp9s0f0np0"); err == nil {
+		t.Fatal("expected error for a non-integer speed")
+	}
+	if _, err := ops.GetPfLinkSpeed("0000:08:00.0", "missing0"); err == nil {
+		t.Fatal("expected error for a missing netdev")
 	}
 }
 

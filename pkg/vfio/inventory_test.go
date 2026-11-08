@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -241,6 +242,77 @@ func TestBuildDevicesUplinkNoBridge(t *testing.T) {
 		return
 	}
 	t.Fatalf("VF device missing: %v", deviceNames(devices))
+}
+
+// TestBuildDevicesPfLinkSpeed: VFs publish their PF netdev's link speed, an
+// InfiniBand VF its PF's IPoIB speed; a whole PF and a VF whose PF has no
+// netdev publish none.
+func TestBuildDevicesPfLinkSpeed(t *testing.T) {
+	b := inventoryFixture(t)
+	b.linkSpeed("0000:08:00.0", "enp8s0f0np0", "400000")
+	b.linkSpeed("0000:0c:00.0", "ibp12s0", "200000")
+	// A vfio-bound PF with a vfio-bound VF: no netdev to read.
+	b.device("0000:61:00.0", "0x020000", "vfio-pci", "90")
+	b.device("0000:61:00.2", "0x020000", "vfio-pci", "91")
+	b.vf("0000:61:00.2", "0000:61:00.0", "0")
+
+	devices, specs := New("node-1", WithSysfs(b.ops())).buildDevices()
+	got := pfLinkSpeeds(devices)
+	want := map[string]int64{
+		"pci-0000-08-00-2": 400000,
+		"pci-0000-08-00-3": 400000,
+		"pci-0000-0c-00-2": 200000,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pfLinkSpeedMbps = %v, want %v", got, want)
+	}
+	if s := specs["pci-0000-08-00-2"].PFLinkSpeedMbps; s != 400000 {
+		t.Errorf("spec PFLinkSpeedMbps = %d, want 400000", s)
+	}
+	if s := specs["pci-0000-61-00-2"]; s.Kind != KindVF || s.PFName != "" {
+		t.Fatalf("VF of a vfio-bound PF: spec %#v, want a VF without pfName", s)
+	}
+}
+
+// TestBuildDevicesPfLinkSpeedUnknown: a speed that is not positive (-1 while
+// the link is down) or cannot be read publishes no attribute.
+func TestBuildDevicesPfLinkSpeedUnknown(t *testing.T) {
+	speedFile := []string{"bus/pci/devices", "0000:08:00.0", "net", "enp8s0f0np0", "speed"}
+	tests := []struct {
+		name  string
+		setup func(b *sysfsBuilder)
+	}{
+		{name: "link down", setup: func(b *sysfsBuilder) { b.linkSpeed("0000:08:00.0", "enp8s0f0np0", "-1") }},
+		{name: "zero", setup: func(b *sysfsBuilder) { b.linkSpeed("0000:08:00.0", "enp8s0f0np0", "0") }},
+		{name: "not an integer", setup: func(b *sysfsBuilder) { b.linkSpeed("0000:08:00.0", "enp8s0f0np0", "unknown") }},
+		{name: "no speed file", setup: func(*sysfsBuilder) {}},
+		// A read error regardless of the test's uid.
+		{name: "unreadable", setup: func(b *sysfsBuilder) { b.mkdir(speedFile...) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := inventoryFixture(t)
+			tc.setup(b)
+			devices, specs := New("node-1", WithSysfs(b.ops())).buildDevices()
+			if got := pfLinkSpeeds(devices); len(got) != 0 {
+				t.Fatalf("pfLinkSpeedMbps = %v, want none", got)
+			}
+			if s := specs["pci-0000-08-00-2"].PFLinkSpeedMbps; s != 0 {
+				t.Errorf("spec PFLinkSpeedMbps = %d, want 0", s)
+			}
+		})
+	}
+}
+
+// pfLinkSpeeds maps each device carrying pfLinkSpeedMbps to its value.
+func pfLinkSpeeds(devices []resourceapi.Device) map[string]int64 {
+	out := map[string]int64{}
+	for _, dev := range devices {
+		if a, ok := dev.Attributes[AttrDomain+"/pfLinkSpeedMbps"]; ok {
+			out[dev.Name] = *a.IntValue
+		}
+	}
+	return out
 }
 
 func deviceNames(devices []resourceapi.Device) []string {

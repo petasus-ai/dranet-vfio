@@ -27,6 +27,11 @@ Driver name: `vfio.petasus.io`.
   which also backs a VF whose PF reports zeros, and, on a whole PF, the
   record's `ibdev` as `rdmaDevice` — the RDMA device name the PF exposed
   before it was bound; unknown = attribute absent;
+  plus, on VFs whose PF keeps a netdev, `pfLinkSpeedMbps`: the PF netdev's
+  link speed in Mb/s as its sysfs `speed` reports it (`400000` for a 400G
+  port; IPoIB on an InfiniBand PF), the line rate the VF shares with its
+  siblings, not a rate of its own; absent while the link is down or the speed
+  is unknown, present from the first rescan with the link up;
   plus the uplink VLAN snapshot on Ethernet VFs whose PF keeps a netdev:
   `uplink,bridge,vlanFiltering,uplinkVlans,untaggedVlan`, and
   `uplinkVlansExact` — a comma-padded full VID enumeration for CEL

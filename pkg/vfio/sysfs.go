@@ -87,6 +87,7 @@ type SysfsOps interface {
 	GetPciClass(devPci string) (string, error)
 	GetPfPci(vfPci string) (string, error)
 	GetPfName(pfPci string) (string, error)
+	GetPfLinkSpeed(pfPci, pfName string) (int, error)
 	GetVfIndex(pfPci, vfPci string) (int, error)
 	GetDriver(devPci string) (string, error)
 	GetVendorID(devPci string) (string, error)
@@ -212,6 +213,22 @@ func (o *realSysfs) GetPfName(pfPci string) (string, error) {
 		return "", fmt.Errorf("no uplink netdev found for PF %s: all %d netdevs are representors", pfPci, len(entries))
 	}
 	return "", fmt.Errorf("no network device found for PF %s", pfPci)
+}
+
+// GetPfLinkSpeed returns the link speed in Mb/s the kernel reports for the
+// PF's netdev pfName (IPoIB on an InfiniBand PF). The read fails while the
+// netdev is administratively down; without link the kernel reports -1.
+func (o *realSysfs) GetPfLinkSpeed(pfPci, pfName string) (int, error) {
+	p := filepath.Join(o.basePath, "bus/pci/devices", pfPci, "net", pfName, "speed")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read link speed of %s (PF %s): %w", pfName, pfPci, err)
+	}
+	speed, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse link speed of %s (PF %s): %w", pfName, pfPci, err)
+	}
+	return speed, nil
 }
 
 // GetVfIndex finds the VF index by enumerating virtfn* symlinks under the PF.
