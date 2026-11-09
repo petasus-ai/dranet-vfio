@@ -57,6 +57,32 @@ type NetlinkOps interface {
 	// LinkGetVfIbGUIDs reads the administrative InfiniBand node/port GUID of
 	// every VF of the PF netdev (rtnetlink IFLA_VF_IB_*_GUID), keyed by VF index.
 	LinkGetVfIbGUIDs(pfName string) (map[int]VfIbGUID, error)
+	// LinkGetVfStats reads the PF netdev's link state and every VF's counters
+	// and transmit cap in one RTM_GETLINK.
+	LinkGetVfStats(pfName string) (*PfVfStats, error)
+}
+
+// PfVfStats is a PF netdev's link state and its VFs' statistics.
+type PfVfStats struct {
+	OperState uint8  // IFLA_OPERSTATE
+	Flags     uint32 // ifi_flags
+	// VFs by the VF number each entry carries; the kernel leaves out a VF
+	// whose configuration it cannot read, so positions do not count.
+	VFs map[int]VfStats
+}
+
+// VfStats is one VF's IFLA_VF_STATS (VF-relative: rx is what the VF
+// received) and IFLA_VF_RATE maximum.
+type VfStats struct {
+	RxBytes   uint64
+	TxBytes   uint64
+	RxPackets uint64
+	TxPackets uint64
+	Multicast uint64
+	Broadcast uint64
+	RxDropped uint64
+	TxDropped uint64
+	MaxTxRate uint32 // Mbit/s, 0 = none
 }
 
 // VfIbGUID is one VF's administrative InfiniBand GUIDs as the PF reports them
@@ -209,4 +235,126 @@ func (o *realNetlink) LinkGetVfIbGUIDs(pfName string) (map[int]VfIbGUID, error) 
 		}
 	}
 	return out, nil
+}
+
+func (o *realNetlink) LinkGetVfStats(pfName string) (*PfVfStats, error) {
+	req := nl.NewNetlinkRequest(unix.RTM_GETLINK, 0)
+	req.AddData(nl.NewIfInfomsg(unix.AF_UNSPEC))
+	nameAttr := uint16(unix.IFLA_IFNAME)
+	if len(pfName) > 15 {
+		nameAttr = unix.IFLA_ALT_IFNAME
+	}
+	req.AddData(nl.NewRtAttr(int(nameAttr), nl.ZeroTerminated(pfName)))
+	req.AddData(nl.NewRtAttr(unix.IFLA_EXT_MASK, nl.Uint32Attr(nl.RTEXT_FILTER_VF)))
+	msgs, err := req.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWLINK)
+	if err != nil {
+		return nil, fmt.Errorf("getlink %s: %w", pfName, err)
+	}
+	if len(msgs) != 1 {
+		return nil, fmt.Errorf("getlink %s: %d replies", pfName, len(msgs))
+	}
+	return parseVfStats(msgs[0])
+}
+
+// parseVfStats decodes an RTM_NEWLINK message. Each VF is keyed by the vf
+// field of its IFLA_VF_MAC; an entry whose IFLA_VF_RATE names another VF,
+// or a VF number seen twice, counts as missing.
+func parseVfStats(msg []byte) (*PfVfStats, error) {
+	if len(msg) < unix.SizeofIfInfomsg {
+		return nil, fmt.Errorf("short link message (%d bytes)", len(msg))
+	}
+	out := &PfVfStats{Flags: nl.DeserializeIfInfomsg(msg).Flags, VFs: map[int]VfStats{}}
+	attrs, err := nl.ParseRouteAttr(msg[unix.SizeofIfInfomsg:])
+	if err != nil {
+		return nil, err
+	}
+	native := nl.NativeEndian()
+	duplicate := map[int]bool{}
+	for _, a := range attrs {
+		switch a.Attr.Type {
+		case unix.IFLA_OPERSTATE:
+			if len(a.Value) >= 1 {
+				out.OperState = a.Value[0]
+			}
+		case unix.IFLA_VFINFO_LIST:
+			entries, err := nl.ParseRouteAttr(a.Value)
+			if err != nil {
+				return nil, err
+			}
+			for _, entry := range entries {
+				if entry.Attr.Type != nl.IFLA_VF_INFO {
+					continue
+				}
+				fields, err := nl.ParseRouteAttr(entry.Value)
+				if err != nil {
+					return nil, err
+				}
+				vf, rateVf := -1, -1
+				var st VfStats
+				for _, f := range fields {
+					switch f.Attr.Type {
+					case nl.IFLA_VF_MAC:
+						if len(f.Value) >= 4 {
+							vf = int(native.Uint32(f.Value[0:4]))
+						}
+					case nl.IFLA_VF_RATE:
+						// struct ifla_vf_rate { vf, min_tx_rate, max_tx_rate }
+						if len(f.Value) >= nl.SizeofVfRate {
+							rateVf = int(native.Uint32(f.Value[0:4]))
+							st.MaxTxRate = native.Uint32(f.Value[8:12])
+						}
+					case nl.IFLA_VF_STATS:
+						if err := parseVfCounters(f.Value, &st); err != nil {
+							return nil, err
+						}
+					}
+				}
+				if vf < 0 || (rateVf >= 0 && rateVf != vf) {
+					continue
+				}
+				if _, seen := out.VFs[vf]; seen || duplicate[vf] {
+					duplicate[vf] = true
+					delete(out.VFs, vf)
+					continue
+				}
+				out.VFs[vf] = st
+			}
+		}
+	}
+	return out, nil
+}
+
+// parseVfCounters decodes IFLA_VF_STATS by the kernel's numbering
+// (netlink v1.3.1 numbers the drop counters without IFLA_VF_STATS_PAD).
+func parseVfCounters(data []byte, st *VfStats) error {
+	attrs, err := nl.ParseRouteAttr(data)
+	if err != nil {
+		return err
+	}
+	native := nl.NativeEndian()
+	for _, a := range attrs {
+		if len(a.Value) != 8 {
+			continue
+		}
+		v := native.Uint64(a.Value)
+		switch a.Attr.Type {
+		case unix.IFLA_VF_STATS_RX_PACKETS:
+			st.RxPackets = v
+		case unix.IFLA_VF_STATS_TX_PACKETS:
+			st.TxPackets = v
+		case unix.IFLA_VF_STATS_RX_BYTES:
+			st.RxBytes = v
+		case unix.IFLA_VF_STATS_TX_BYTES:
+			st.TxBytes = v
+		case unix.IFLA_VF_STATS_BROADCAST:
+			st.Broadcast = v
+		case unix.IFLA_VF_STATS_MULTICAST:
+			st.Multicast = v
+		case unix.IFLA_VF_STATS_RX_DROPPED:
+			st.RxDropped = v
+		case unix.IFLA_VF_STATS_TX_DROPPED:
+			st.TxDropped = v
+		}
+	}
+	return nil
 }

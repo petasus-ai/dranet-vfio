@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -60,6 +61,10 @@ type carryState struct {
 	// vfioRestoreRetried holds the claims whose unprepare already failed
 	// once on a restore.
 	vfioRestoreRetried set.Set[types.UID]
+
+	// vfioTelemetry exports the host's VF and PF telemetry at scrape time;
+	// nil without a vfio inventory.
+	vfioTelemetry *vfio.Telemetry
 }
 
 // CarryDeviceConfig is embedded in DeviceConfig, so its fields sit at the top
@@ -105,6 +110,33 @@ func (np *NetworkDriver) initCarry() {
 	np.vfioConfigurer = vfio.NewConfigurer(vfio.NewSysfs(), vfio.NewNetlink(), np.vfLockDir)
 	np.vfioCDI = &cdi.Writer{DriverName: np.driverName, SpecDir: np.cdiDir}
 	np.vfioRestoreRetried = set.New[types.UID]()
+	if lister, ok := np.netdb.(vfioSpecLister); ok {
+		np.vfioTelemetry = vfio.NewTelemetry(vfio.TelemetryConfig{Specs: lister.VfioSpecs, Holders: np.vfioHolders})
+		// The default registry is what the metrics endpoint serves.
+		if err := prometheus.Register(np.vfioTelemetry); err != nil {
+			klog.Errorf("failed to register the VF telemetry collector: %v", err)
+		}
+	}
+}
+
+// vfioHolders lists the claims the store holds as prepared on each vfio
+// device, by PCI address; the claim UID comes from the entry's CDI device.
+func (np *NetworkDriver) vfioHolders() map[string][]vfio.Holder {
+	holders := map[string][]vfio.Holder{}
+	for _, podUID := range np.podConfigStore.ListPods() {
+		podCfg, _ := np.podConfigStore.GetPodConfig(podUID)
+		for _, cfg := range podCfg.DeviceConfigs {
+			if cfg.VfioPCIAddress == "" {
+				continue
+			}
+			holders[cfg.VfioPCIAddress] = append(holders[cfg.VfioPCIAddress], vfio.Holder{
+				ClaimUID:  cdi.ClaimUIDOf(cfg.CDIDeviceID),
+				Namespace: cfg.Claim.Namespace,
+				Name:      cfg.Claim.Name,
+			})
+		}
+	}
+	return holders
 }
 
 // vfioMetadataVersions are the KEP-5304 metadata versions the helper writes,
@@ -285,6 +317,7 @@ func (np *NetworkDriver) unprepareCarryClaim(claim kubeletplugin.NamespacedObjec
 		klog.Errorf("giving up: %v", err)
 	}
 	np.vfioRestoreRetried.Delete(claim.UID)
+	np.vfioTelemetry.EndClaim(string(claim.UID))
 
 	if np.vfioCDI != nil {
 		if err := np.vfioCDI.Remove(string(claim.UID)); err != nil {

@@ -18,15 +18,20 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	resourceapi "k8s.io/api/resource/v1"
@@ -329,5 +334,213 @@ func TestRequireDeviceMetadataV1beta1(t *testing.T) {
 		if want == "" && got != "" || want != "" && !strings.Contains(got, want) {
 			t.Errorf("claim %s: error %q, want %q", uid, got, want)
 		}
+	}
+}
+
+// telemetryVF is the one published VF of the telemetry tests.
+var telemetryVF = vfio.Spec{
+	PCIAddress: "0000:01:08.2", PFPCIAddress: "0000:01:00.1", PFName: "enp1s0f1np1",
+	VFIndex: 2, Kind: vfio.KindVF, LinkType: vfio.LinkTypeEthernet,
+}
+
+const telemetryDevice = "pci-0000-01-08-2"
+
+// telemetryNetlink is a switchdev PF whose VF 2 counts received bytes.
+type telemetryNetlink struct {
+	vfio.NetlinkOps
+	mu      sync.Mutex
+	rxBytes uint64
+}
+
+func (n *telemetryNetlink) LinkGetVfStats(string) (*vfio.PfVfStats, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return &vfio.PfVfStats{
+		OperState: netlink.OperUp,
+		VFs:       map[int]vfio.VfStats{0: {}, 1: {}, 2: {RxBytes: n.rxBytes}},
+	}, nil
+}
+
+func (n *telemetryNetlink) DevLinkGetEswitchMode(string) (string, error) { return "switchdev", nil }
+
+func (n *telemetryNetlink) receive(bytes uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.rxBytes += bytes
+}
+
+type telemetrySysfs struct{ vfio.SysfsOps }
+
+func (telemetrySysfs) GetDriver(string) (string, error) { return "mlx5_core", nil }
+
+type noEthtool struct{}
+
+func (noEthtool) GetLink(string) (vfio.EthtoolLink, error) {
+	return vfio.EthtoolLink{}, errors.New("ethtool family not available")
+}
+
+// telemetryDriver is a driver over store whose telemetry reads fake host
+// state for telemetryVF.
+func telemetryDriver(t *testing.T, store *PodConfigStore) (*NetworkDriver, *telemetryNetlink) {
+	host := &telemetryNetlink{}
+	np := &NetworkDriver{
+		podConfigStore: store,
+		carryState: carryState{
+			vfioConfigurer:     vfio.NewConfigurer(nil, nil, ""),
+			vfioCDI:            &cdi.Writer{DriverName: "vfio.petasus.io", SpecDir: t.TempDir()},
+			vfioRestoreRetried: set.New[types.UID](),
+		},
+	}
+	np.vfioTelemetry = vfio.NewTelemetry(vfio.TelemetryConfig{
+		Specs:   func() []vfio.Spec { return []vfio.Spec{telemetryVF} },
+		Holders: np.vfioHolders,
+		Sysfs:   telemetrySysfs{},
+		Netlink: host,
+		Ethtool: noEthtool{},
+	})
+	return np, host
+}
+
+func telemetryEntry(claim types.NamespacedName, claimUID string) DeviceConfig {
+	return DeviceConfig{
+		Claim: claim,
+		CarryDeviceConfig: CarryDeviceConfig{
+			VfioPCIAddress: telemetryVF.PCIAddress,
+			VfioState:      &vfio.HostState{Mode: vfio.ModePassthrough, VfPci: telemetryVF.PCIAddress},
+			CDIDeviceID:    "vfio.petasus.io/vfio=" + claimUID + "_nic_" + telemetryDevice,
+		},
+	}
+}
+
+// vfStatsLabels returns the labels of every dranet_vfio_vf_stats_info
+// series of one scrape.
+func vfStatsLabels(t *testing.T, c prometheus.Collector) []map[string]string {
+	t.Helper()
+	reg := prometheus.NewPedanticRegistry()
+	reg.MustRegister(c)
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var out []map[string]string
+	for _, mf := range mfs {
+		if mf.GetName() != "dranet_vfio_vf_stats_info" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			out = append(out, labels)
+		}
+	}
+	return out
+}
+
+// The driver registers the telemetry with the registry the metrics endpoint
+// serves, for a vfio inventory only.
+func TestInitCarryRegistersTheVfioTelemetry(t *testing.T) {
+	np := &NetworkDriver{driverName: "vfio.petasus.io", netdb: vfio.New("node-1")}
+	np.initCarry()
+	if np.vfioTelemetry == nil {
+		t.Fatal("no telemetry for a vfio inventory")
+	}
+	if !prometheus.Unregister(np.vfioTelemetry) {
+		t.Error("the telemetry is not registered with the default registry")
+	}
+
+	other := &NetworkDriver{driverName: "vfio.petasus.io", netdb: newFakeInventoryDB()}
+	other.initCarry()
+	if other.vfioTelemetry != nil {
+		t.Error("telemetry for an inventory without vfio specs")
+	}
+}
+
+// After a restart the checkpoint alone names a VF's holder, the claim UID
+// taken from the entry's CDI device; two entries for one VF name none.
+func TestVfioTelemetryClaimLabelsFromCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := NewPodConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := types.NamespacedName{Namespace: "vm-ns", Name: "vm-nic"}
+	if err := store.SetDeviceConfig("pod-a", telemetryDevice, telemetryEntry(claim, "6f1c0b9e-uid")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewPodConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	np, _ := telemetryDriver(t, restarted)
+
+	if n := testutil.CollectAndCount(np.vfioTelemetry, "dranet_vfio_vf_stats_info"); n != 1 {
+		t.Fatalf("stats_info series = %d, want 1", n)
+	}
+	got := vfStatsLabels(t, np.vfioTelemetry)
+	if len(got) != 1 || got[0]["claim_uid"] != "6f1c0b9e-uid" || got[0]["claim_namespace"] != "vm-ns" || got[0]["claim_name"] != "vm-nic" {
+		t.Fatalf("stats_info labels = %v, want the checkpointed claim", got)
+	}
+
+	stale := types.NamespacedName{Namespace: "vm-ns", Name: "old-nic"}
+	if err := restarted.SetDeviceConfig("pod-old", telemetryDevice, telemetryEntry(stale, "0a9d-uid")); err != nil {
+		t.Fatal(err)
+	}
+	got = vfStatsLabels(t, np.vfioTelemetry)
+	if len(got) != 1 || got[0]["claim_uid"] != "" || got[0]["claim_namespace"] != "" || got[0]["claim_name"] != "" {
+		t.Fatalf("stats_info labels = %v, want no claim for a VF two entries name", got)
+	}
+}
+
+// Scrapes run alongside prepares and unprepares of the VF; once the last
+// claim is unprepared the VF has no holder.
+func TestVfioTelemetryScrapeDuringUnprepare(t *testing.T) {
+	np, host := telemetryDriver(t, mustNewPodConfigStore())
+	reg := prometheus.NewPedanticRegistry()
+	reg.MustRegister(np.vfioTelemetry)
+	stop, scraped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(scraped)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := reg.Gather(); err != nil {
+				t.Errorf("gather: %v", err)
+				return
+			}
+		}
+	}()
+	churn := func() error {
+		for i := range 50 {
+			uid := fmt.Sprintf("claim-%d", i)
+			claim := types.NamespacedName{Namespace: "vm-ns", Name: fmt.Sprintf("vm-nic-%d", i)}
+			if err := np.podConfigStore.SetDeviceConfig(types.UID(fmt.Sprintf("pod-%d", i)), telemetryDevice, telemetryEntry(claim, uid)); err != nil {
+				return err
+			}
+			np.vfioTelemetry.StartClaim(telemetryVF, uid)
+			host.receive(1500)
+			if err := np.unprepareResourceClaim(context.Background(), kubeletplugin.NamespacedObject{NamespacedName: claim, UID: types.UID(uid)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	err := churn()
+	close(stop)
+	<-scraped
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := vfStatsLabels(t, np.vfioTelemetry)
+	if len(got) != 1 || got[0]["claim_uid"] != "" || got[0]["claim_name"] != "" {
+		t.Fatalf("stats_info labels = %v, want an unheld VF", got)
 	}
 }

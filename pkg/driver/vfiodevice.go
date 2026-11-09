@@ -54,6 +54,11 @@ type vfioInventory interface {
 	GetVfioSpec(deviceName string) (vfio.Spec, bool)
 }
 
+// vfioSpecLister lists the sysfs facts of every published device.
+type vfioSpecLister interface {
+	VfioSpecs() []vfio.Spec
+}
+
 // vfioSpecOf resolves the sysfs facts of a device, when the inventory
 // serves vfio-pci devices and the device belongs to it.
 func vfioSpecOf(db inventoryDB, deviceName string) (vfio.Spec, bool) {
@@ -134,6 +139,7 @@ func (np *NetworkDriver) prepareVfioDevice(claim *resourceapi.ResourceClaim, pod
 	if err := np.vfioConfigurer.Apply(state, params); err != nil {
 		return cdispec.Device{}, kubeletplugin.Device{}, fmt.Errorf("failed to configure VFIO device %s: %w", result.Device, err)
 	}
+	np.vfioTelemetry.StartClaim(spec, string(claim.UID))
 	klog.V(4).Infof("VFIO claim resources for pod %s : %#v", podUID, deviceCfg)
 	return cdiDevice, kubeletplugin.Device{
 		Requests:     []string{result.Request},

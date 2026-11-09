@@ -94,6 +94,7 @@ type fakeNetlink struct {
 	eswitchMode map[string]string
 	vlanTable   map[int32][]*nl.BridgeVlanInfo
 	vfIbGuids   map[string]map[int]VfIbGUID // by PF name
+	vfStats     map[string]*PfVfStats       // by PF name
 	calls       []string
 	failOn      map[string]error
 
@@ -110,6 +111,7 @@ func newFakeNetlink() *fakeNetlink {
 		vfInfo:      map[string][]*VfInfo{},
 		eswitchMode: map[string]string{},
 		vlanTable:   map[int32][]*nl.BridgeVlanInfo{},
+		vfStats:     map[string]*PfVfStats{},
 		failOn:      map[string]error{},
 	}
 }
@@ -133,6 +135,14 @@ func (f *fakeNetlink) LinkGetVfIbGUIDs(pfName string) (map[int]VfIbGUID, error) 
 		return nil, fmt.Errorf("no VF GUID info for %s", pfName)
 	}
 	return f.vfIbGuids[pfName], nil
+}
+
+func (f *fakeNetlink) LinkGetVfStats(pfName string) (*PfVfStats, error) {
+	stats, ok := f.vfStats[pfName]
+	if !ok {
+		return nil, netlink.LinkNotFoundError{}
+	}
+	return stats, nil
 }
 
 func (f *fakeNetlink) LinkByName(name string) (netlink.Link, error) {

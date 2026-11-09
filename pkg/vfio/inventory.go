@@ -322,6 +322,9 @@ type uplinkState struct {
 	hasFiltering bool
 	vlans        []*nl.BridgeVlanInfo
 	hasVlans     bool
+	// speedMbps is the uplink's own link speed when it is not the PF (a
+	// bond of PFs: VF-LAG); 0 otherwise or when unknown.
+	speedMbps int
 }
 
 // uplinkResolver memoizes uplinkState per PF within one sync pass and fetches
@@ -346,6 +349,13 @@ func (r *uplinkResolver) stateFor(pfName string) *uplinkState {
 		return st
 	}
 	st.uplink = uplink
+	if uplink != pfName {
+		if speed, err := r.sysfs.GetNetdevLinkSpeed(uplink); err != nil {
+			klog.V(4).Infof("vfio inventory: no link speed for uplink %s: %v", uplink, err)
+		} else if speed > 0 {
+			st.speedMbps = speed
+		}
+	}
 	bridge, err := detectBridge(r.netlink, uplink)
 	if err != nil {
 		klog.V(4).Infof("vfio inventory: no bridge for uplink %s: %v", uplink, err)
@@ -521,6 +531,9 @@ func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Devic
 		if up.uplink != "" {
 			device.Attributes[AttrDomain+"/uplink"] = resourceapi.DeviceAttribute{StringValue: ptr.To(up.uplink)}
 		}
+		if up.speedMbps > 0 {
+			device.Attributes[AttrDomain+"/uplinkLinkSpeedMbps"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(up.speedMbps))}
+		}
 		if up.bridge != "" {
 			device.Attributes[AttrDomain+"/bridge"] = resourceapi.DeviceAttribute{StringValue: ptr.To(up.bridge)}
 		}
@@ -603,6 +616,19 @@ func (inv *Inventory) GetVfioSpec(deviceName string) (Spec, bool) {
 	defer inv.mu.RUnlock()
 	spec, ok := inv.specs[deviceName]
 	return spec, ok
+}
+
+// VfioSpecs returns the sysfs facts of every published device, by PCI
+// address.
+func (inv *Inventory) VfioSpecs() []Spec {
+	inv.mu.RLock()
+	defer inv.mu.RUnlock()
+	specs := make([]Spec, 0, len(inv.specs))
+	for _, spec := range inv.specs {
+		specs = append(specs, spec)
+	}
+	sort.Slice(specs, func(i, j int) bool { return specs[i].PCIAddress < specs[j].PCIAddress })
+	return specs
 }
 
 // GetNetInterfaceName never resolves: a vfio-pci-bound device has no

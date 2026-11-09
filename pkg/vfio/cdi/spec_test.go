@@ -66,3 +66,17 @@ func TestWriteAndRemove(t *testing.T) {
 		t.Errorf("Remove of a missing spec: %v", err)
 	}
 }
+
+func TestClaimUIDOf(t *testing.T) {
+	w := &Writer{DriverName: "vfio.petasus.io"}
+	for id, want := range map[string]string{
+		w.DeviceID(DeviceName("6f1c-uid", "nic", "pci-0000-01-08-2")): "6f1c-uid",
+		"vfio.petasus.io/vfio=no-separator":                           "",
+		"uid_nic_dev":                                                 "",
+		"":                                                            "",
+	} {
+		if got := ClaimUIDOf(id); got != want {
+			t.Errorf("ClaimUIDOf(%q) = %q, want %q", id, got, want)
+		}
+	}
+}

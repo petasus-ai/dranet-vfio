@@ -158,6 +158,50 @@ func TestBuildDevices(t *testing.T) {
 	}
 }
 
+// TestBuildDevicesUplinkLinkSpeed: a VF whose PF is a bond member publishes
+// the bond's speed apart from the PF's; a PF that is its own uplink, or a
+// bond without link, publishes none.
+func TestBuildDevicesUplinkLinkSpeed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		bond  bool
+		speed string
+		want  int64
+	}{
+		{name: "bond up", bond: true, speed: "50000", want: 50000},
+		{name: "bond without link", bond: true, speed: "-1"},
+		{name: "PF is its own uplink"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := inventoryFixture(t)
+			nlops := newFakeNetlink()
+			if tc.bond {
+				nlops.addLink("enp8s0f0np0", "device", 1, 2, 1500)
+				nlops.addLink("bond0", "bond", 2, 0, 1500)
+				b.writeFile(tc.speed, "class/net/bond0/speed")
+			} else {
+				nlops.addLink("enp8s0f0np0", "device", 1, 0, 1500)
+			}
+			devices, _ := New("node-1", WithSysfs(b.ops()), WithNetlink(nlops)).buildDevices()
+			for _, dev := range devices {
+				if dev.Name != "pci-0000-08-00-2" {
+					continue
+				}
+				got, ok := dev.Attributes[AttrDomain+"/uplinkLinkSpeedMbps"]
+				switch {
+				case tc.want == 0 && ok:
+					t.Fatalf("uplinkLinkSpeedMbps = %d, want none", *got.IntValue)
+				case tc.want != 0 && (!ok || *got.IntValue != tc.want):
+					t.Fatalf("uplinkLinkSpeedMbps = %v, want %d", got.IntValue, tc.want)
+				}
+				if s, ok := dev.Attributes[AttrDomain+"/pfLinkSpeedMbps"]; ok && tc.want != 0 && *s.IntValue == tc.want {
+					t.Fatal("the uplink speed must not replace the PF's")
+				}
+			}
+		})
+	}
+}
+
 // TestBuildDevicesUplinkVlans: ethernet VFs publish their PF uplink's VLAN
 // snapshot; InfiniBand and whole-PF devices publish none.
 func TestBuildDevicesUplinkVlans(t *testing.T) {
@@ -321,6 +365,19 @@ func deviceNames(devices []resourceapi.Device) []string {
 		names = append(names, dev.Name)
 	}
 	return names
+}
+
+func TestVfioSpecs(t *testing.T) {
+	inv := New("node-1", WithSysfs(inventoryFixture(t).ops()))
+	inv.sync(true)
+	var got []string
+	for _, spec := range inv.VfioSpecs() {
+		got = append(got, spec.PCIAddress)
+	}
+	want := []string{"0000:08:00.2", "0000:08:00.3", "0000:0c:00.2", "0000:51:00.0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("VfioSpecs() = %v, want %v", got, want)
+	}
 }
 
 // TestBuildDevices_InfinibandGUIDs: an IB VF publishes the GUIDs its PF

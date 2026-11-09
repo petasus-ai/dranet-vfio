@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
 
@@ -78,6 +79,20 @@ func DeviceName(claimUID, requestName, deviceName string) string {
 // DeviceID is the fully qualified CDI device name returned to kubelet.
 func (w *Writer) DeviceID(deviceName string) string {
 	return w.Kind() + "=" + deviceName
+}
+
+// ClaimUIDOf returns the claim UID of a device ID built from DeviceName, ""
+// when id is not one.
+func ClaimUIDOf(id string) string {
+	_, name, ok := strings.Cut(id, "=")
+	if !ok {
+		return ""
+	}
+	uid, _, ok := strings.Cut(name, "_")
+	if !ok {
+		return ""
+	}
+	return uid
 }
 
 // Write atomically replaces the CDI spec of one claim, at the oldest spec

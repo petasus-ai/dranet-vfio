@@ -88,6 +88,7 @@ type SysfsOps interface {
 	GetPfPci(vfPci string) (string, error)
 	GetPfName(pfPci string) (string, error)
 	GetPfLinkSpeed(pfPci, pfName string) (int, error)
+	GetNetdevLinkSpeed(name string) (int, error)
 	GetVfIndex(pfPci, vfPci string) (int, error)
 	GetDriver(devPci string) (string, error)
 	GetVendorID(devPci string) (string, error)
@@ -213,6 +214,21 @@ func (o *realSysfs) GetPfName(pfPci string) (string, error) {
 		return "", fmt.Errorf("no uplink netdev found for PF %s: all %d netdevs are representors", pfPci, len(entries))
 	}
 	return "", fmt.Errorf("no network device found for PF %s", pfPci)
+}
+
+// GetNetdevLinkSpeed returns the link speed in Mb/s the kernel reports for
+// netdev name; for a bond, the sum of its active members (802.3ad: those of
+// the active aggregator). -1 without link.
+func (o *realSysfs) GetNetdevLinkSpeed(name string) (int, error) {
+	data, err := os.ReadFile(filepath.Join(o.basePath, "class/net", name, "speed"))
+	if err != nil {
+		return 0, fmt.Errorf("failed to read link speed of %s: %w", name, err)
+	}
+	speed, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse link speed of %s: %w", name, err)
+	}
+	return speed, nil
 }
 
 // GetPfLinkSpeed returns the link speed in Mb/s the kernel reports for the

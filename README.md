@@ -32,6 +32,9 @@ Driver name: `vfio.petasus.io`.
   port; IPoIB on an InfiniBand PF), the line rate the VF shares with its
   siblings, not a rate of its own; absent while the link is down or the speed
   is unknown, present from the first rescan with the link up;
+  plus, where the PF is a bond member (VF-LAG), `uplinkLinkSpeedMbps`: the
+  bond's sysfs `speed`, the sum of its active members (a single flow still
+  takes one member);
   plus the uplink VLAN snapshot on Ethernet VFs whose PF keeps a netdev:
   `uplink,bridge,vlanFiltering,uplinkVlans,untaggedVlan`, and
   `uplinkVlansExact` — a comma-padded full VID enumeration for CEL
@@ -88,6 +91,20 @@ Driver name: `vfio.petasus.io`.
   ```
 
   Any other key fails prepare.
+
+- The metrics endpoint (`--bind-address`, `:9178`) also serves the host's
+  view of the published VFs and their PF netdevs, read at scrape time:
+  `dranet_vfio_pf_*` (rtnetlink read status, ethtool link state, speed,
+  supported/advertised maximum, and `dranet_vfio_pf_link_info{duplex,autoneg,eswitch_mode,driver}`)
+  and, per VF, its PF's VF counters (`dranet_vfio_vf_{rx,tx}_{bytes,packets}_total`,
+  `dranet_vfio_vf_rx_{multicast,broadcast}_total`, drops in eswitch legacy
+  mode only), `dranet_vfio_vf_max_tx_rate_mbps` and
+  `dranet_vfio_vf_stats_info{counters,drops}`. VF series carry the claim
+  prepared on the VF (`claim_uid`, `claim_namespace`, `claim_name`) and
+  `since`, the unix second its counters count from: a successful prepare,
+  the driver's first reading, or a counter reset starts a new one. Counters
+  are exported for `mlx5_core` PFs only (rtnetlink reports zeros for a driver
+  that fills none).
 
 KubeVirt consumes the device with `interfaces[].sriov: {}` and
 `spec.networks[].resourceClaim` (`NetworkDevicesWithDRA` feature gate); the

@@ -216,6 +216,18 @@ func TestGetPfName(t *testing.T) {
 	}
 }
 
+func TestGetNetdevLinkSpeed(t *testing.T) {
+	b := newSysfsBuilder(t)
+	b.writeFile("50000", "class/net/bond0/speed")
+	ops := b.ops()
+	if speed, err := ops.GetNetdevLinkSpeed("bond0"); err != nil || speed != 50000 {
+		t.Fatalf("GetNetdevLinkSpeed = %d, %v; want 50000", speed, err)
+	}
+	if _, err := ops.GetNetdevLinkSpeed("missing0"); err == nil {
+		t.Fatal("a missing netdev must fail")
+	}
+}
+
 func TestGetPfLinkSpeed(t *testing.T) {
 	b := newSysfsBuilder(t)
 	b.device("0000:08:00.0", "0x020000", "mlx5_core", "")
