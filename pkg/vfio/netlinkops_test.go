@@ -17,6 +17,7 @@ limitations under the License.
 package vfio
 
 import (
+	"net"
 	"reflect"
 	"testing"
 
@@ -25,13 +26,19 @@ import (
 )
 
 // vfInfoEntry builds one IFLA_VF_INFO as rtnl_fill_vfinfo does, the VF
-// number in IFLA_VF_MAC and IFLA_VF_RATE.
+// number in each setting; the VF's MAC ends in its number, its VLAN is
+// 100 plus it and its minimum rate a tenth of the maximum.
 func vfInfoEntry(macVf, rateVf, maxTxRate uint32, counters map[int]uint64) *nl.RtAttr {
 	entry := nl.NewRtAttr(nl.IFLA_VF_INFO, nil)
 	mac := nl.VfMac{Vf: macVf}
+	copy(mac.Mac[:], []byte{0x02, 0, 0, 0, 0, byte(macVf)})
 	entry.AddRtAttr(nl.IFLA_VF_MAC, mac.Serialize())
-	rate := nl.VfRate{Vf: rateVf, MaxTxRate: maxTxRate}
+	vlan := nl.VfVlan{Vf: macVf, Vlan: 100 + macVf}
+	entry.AddRtAttr(nl.IFLA_VF_VLAN, vlan.Serialize())
+	rate := nl.VfRate{Vf: rateVf, MinTxRate: maxTxRate / 10, MaxTxRate: maxTxRate}
 	entry.AddRtAttr(nl.IFLA_VF_RATE, rate.Serialize())
+	state := nl.VfLinkState{Vf: macVf, LinkState: nl.IFLA_VF_LINK_STATE_ENABLE}
+	entry.AddRtAttr(nl.IFLA_VF_LINK_STATE, state.Serialize())
 	stats := entry.AddRtAttr(nl.IFLA_VF_STATS, nil)
 	for _, typ := range []int{
 		unix.IFLA_VF_STATS_RX_PACKETS, unix.IFLA_VF_STATS_TX_PACKETS, unix.IFLA_VF_STATS_RX_BYTES,
@@ -88,8 +95,10 @@ func TestParseVfStats(t *testing.T) {
 		OperState: 6,
 		Flags:     unix.IFF_UP | unix.IFF_LOWER_UP,
 		VFs: map[int]VfStats{
-			0: {RxPackets: 1, TxPackets: 2, RxBytes: 3, TxBytes: 4, Broadcast: 5, Multicast: 6, RxDropped: 7, TxDropped: 8},
-			2: {RxPackets: 21, TxPackets: 22, RxBytes: 23, TxBytes: 24, Broadcast: 25, Multicast: 26, RxDropped: 27, TxDropped: 28, MaxTxRate: 1000},
+			0: {RxPackets: 1, TxPackets: 2, RxBytes: 3, TxBytes: 4, Broadcast: 5, Multicast: 6, RxDropped: 7, TxDropped: 8,
+				Mac: net.HardwareAddr{0x02, 0, 0, 0, 0, 0}, Vlan: 100, LinkState: nl.IFLA_VF_LINK_STATE_ENABLE},
+			2: {RxPackets: 21, TxPackets: 22, RxBytes: 23, TxBytes: 24, Broadcast: 25, Multicast: 26, RxDropped: 27, TxDropped: 28,
+				MinTxRate: 100, MaxTxRate: 1000, Mac: net.HardwareAddr{0x02, 0, 0, 0, 0, 2}, Vlan: 102, LinkState: nl.IFLA_VF_LINK_STATE_ENABLE},
 		},
 	}
 	if !reflect.DeepEqual(got, want) {

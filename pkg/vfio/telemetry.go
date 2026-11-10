@@ -30,9 +30,13 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// mlx5Driver is the PF driver whose VF counters are trusted: rtnetlink
-// reports zeros for a driver without ndo_get_vf_stats.
+// mlx5Driver is the one PF driver with an eswitch mode (devlink); every other
+// driver's VFs are legacy.
 const mlx5Driver = "mlx5_core"
+
+// vfCounterDrivers fill IFLA_VF_STATS (ndo_get_vf_stats) on every supported
+// kernel; rtnetlink reports zeros for any other driver.
+var vfCounterDrivers = map[string]bool{mlx5Driver: true, "i40e": true, "ice": true}
 
 // VF counter support, the counters and drops labels of
 // dranet_vfio_vf_stats_info.
@@ -76,7 +80,7 @@ var (
 
 	pfStatsUpDesc       = pfDesc("stats_up", "1 when the PF's VF statistics were read over rtnetlink.")
 	pfLinkUpDesc        = pfDesc("link_up", "1 when the PF's link is detected.")
-	pfLinkSpeedDesc     = pfDesc("link_speed_mbps", "Speed of the PF's link in Mb/s.")
+	pfLinkSpeedDesc     = pfDesc("link_speed_mbps", "Speed of the PF's link in Mb/s while it is up.")
 	pfSupportedMaxDesc  = pfDesc("link_supported_max_speed_mbps", "Fastest link mode the PF supports, in Mb/s.")
 	pfAdvertisedMaxDesc = pfDesc("link_advertised_max_speed_mbps", "Fastest link mode the PF advertises, in Mb/s.")
 	pfLinkInfoDesc      = prometheus.NewDesc("dranet_vfio_pf_link_info",
@@ -405,9 +409,15 @@ func (t *Telemetry) readPF(pf *telemetryPF) pfReading {
 	if r.eth, err = t.ethtool.GetLink(pf.name); err != nil {
 		klog.V(4).Infof("vfio telemetry: ethtool of PF %s (%s): %v", pf.name, pf.pci, err)
 	}
-	r.mode = telemetryEswitchMode(t.netlink, pf.pci)
 	if r.driver, err = t.sysfs.GetDriver(pf.pci); err != nil {
 		klog.V(4).Infof("vfio telemetry: PF %s: %v", pf.pci, err)
+	}
+	switch r.driver {
+	case mlx5Driver:
+		r.mode = telemetryEswitchMode(t.netlink, pf.pci)
+	case "":
+	default:
+		r.mode = ModeLegacy
 	}
 	return r
 }
@@ -434,13 +444,17 @@ func (t *Telemetry) commitPF(ch chan<- prometheus.Metric, pf *telemetryPF, r pfR
 	// No VF entries at all: missing CAP_NET_ADMIN, or SR-IOV disabled.
 	statsUp := r.stats != nil && len(r.stats.VFs) > 0
 	gauge(ch, pfStatsUpDesc, boolValue(statsUp), pf.pci, pf.name)
+	up := false
 	switch {
 	case r.eth.HasLink:
-		gauge(ch, pfLinkUpDesc, boolValue(r.eth.Link), pf.pci, pf.name)
+		up = r.eth.Link
+		gauge(ch, pfLinkUpDesc, boolValue(up), pf.pci, pf.name)
 	case r.stats != nil:
-		gauge(ch, pfLinkUpDesc, boolValue(carrier(r.stats)), pf.pci, pf.name)
+		up = carrier(r.stats)
+		gauge(ch, pfLinkUpDesc, boolValue(up), pf.pci, pf.name)
 	}
-	if r.eth.SpeedMbps > 0 {
+	// A driver may keep reporting the last speed of a link that is down.
+	if up && r.eth.SpeedMbps > 0 {
 		gauge(ch, pfLinkSpeedDesc, float64(r.eth.SpeedMbps), pf.pci, pf.name)
 	}
 	if r.eth.SupportedMaxMbps > 0 {
@@ -493,12 +507,12 @@ func (t *Telemetry) commitPF(ch chan<- prometheus.Metric, pf *telemetryPF, r pfR
 
 // vfStatsSupport tells which counters a VF's PF fills: mlx5 in switchdev mode
 // leaves the drop counters at zero, and an InfiniBand VF reports none. Drops
-// need a stated legacy mode.
+// need a legacy mode.
 func vfStatsSupport(linkType, driver string, mode Mode) (counters, drops string) {
 	switch {
 	case linkType == LinkTypeInfiniband:
 		return statsUnsupported, statsUnsupported
-	case driver != mlx5Driver:
+	case !vfCounterDrivers[driver]:
 		return statsUnverified, statsUnsupported
 	case mode == ModeLegacy:
 		return statsSupported, statsSupported

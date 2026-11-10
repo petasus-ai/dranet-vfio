@@ -72,7 +72,7 @@ type PfVfStats struct {
 }
 
 // VfStats is one VF's IFLA_VF_STATS (VF-relative: rx is what the VF
-// received) and IFLA_VF_RATE maximum.
+// received) and its settings.
 type VfStats struct {
 	RxBytes   uint64
 	TxBytes   uint64
@@ -82,7 +82,11 @@ type VfStats struct {
 	Broadcast uint64
 	RxDropped uint64
 	TxDropped uint64
+	MinTxRate uint32 // Mbit/s, 0 = none
 	MaxTxRate uint32 // Mbit/s, 0 = none
+	Mac       net.HardwareAddr
+	Vlan      int
+	LinkState uint32
 }
 
 // VfIbGUID is one VF's administrative InfiniBand GUIDs as the PF reports them
@@ -154,36 +158,30 @@ func (o *realNetlink) DevLinkGetEswitchMode(pfPci string) (string, error) {
 	return dev.Attrs.Eswitch.Mode, nil
 }
 
-// LinkGetVfInfo reads the current settings of a VF from its PF.
-//
-// netlink.LinkByName requests IFLA_EXT_MASK=RTEXT_FILTER_VF, so the
-// kernel fills in IFLA_VFINFO_LIST; the resulting slice is indexed by VF
-// number. An empty slice means the PF exposes no VF info at all — most
-// often because the caller is not running with CAP_NET_ADMIN.
+// LinkGetVfInfo reads the current settings of a VF from its PF, by the VF
+// number its entry carries.
 func (o *realNetlink) LinkGetVfInfo(pfName string, vf int) (*VfInfo, error) {
 	if vf < 0 {
 		return nil, fmt.Errorf("invalid VF index %d for PF %s", vf, pfName)
 	}
-	link, err := nlwrap.LinkByName(pfName)
+	stats, err := o.LinkGetVfStats(pfName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get PF link %s: %w", pfName, err)
+		return nil, fmt.Errorf("failed to read the VFs of PF %s: %w", pfName, err)
 	}
-	vfs := link.Attrs().Vfs
-	if len(vfs) == 0 {
+	if len(stats.VFs) == 0 {
 		return nil, fmt.Errorf("PF %s reports no VF info (missing CAP_NET_ADMIN, or SR-IOV not enabled?)", pfName)
 	}
-	if vf >= len(vfs) {
-		return nil, fmt.Errorf("VF index %d out of range (PF %s has %d VFs)", vf, pfName, len(vfs))
+	st, ok := stats.VFs[vf]
+	if !ok {
+		return nil, fmt.Errorf("PF %s reports no entry for VF %d", pfName, vf)
 	}
-	vi := vfs[vf]
-	info := &VfInfo{
-		Mac:       vi.Mac,
-		Vlan:      vi.Vlan,
-		LinkState: vi.LinkState,
-		MinTxRate: int(vi.MinTxRate),
-		MaxTxRate: int(vi.MaxTxRate),
-	}
-	return info, nil
+	return &VfInfo{
+		Mac:       st.Mac,
+		Vlan:      st.Vlan,
+		LinkState: st.LinkState,
+		MinTxRate: int(st.MinTxRate),
+		MaxTxRate: int(st.MaxTxRate),
+	}, nil
 }
 
 // LinkGetVfIbGUIDs dumps the PF's VF info list with the VF filter and picks
@@ -294,13 +292,24 @@ func parseVfStats(msg []byte) (*PfVfStats, error) {
 				for _, f := range fields {
 					switch f.Attr.Type {
 					case nl.IFLA_VF_MAC:
-						if len(f.Value) >= 4 {
-							vf = int(native.Uint32(f.Value[0:4]))
+						if len(f.Value) >= nl.SizeofVfMac {
+							mac := nl.DeserializeVfMac(f.Value)
+							vf = int(mac.Vf)
+							st.Mac = append(net.HardwareAddr(nil), mac.Mac[:6]...)
+						}
+					case nl.IFLA_VF_VLAN:
+						if len(f.Value) >= nl.SizeofVfVlan {
+							st.Vlan = int(nl.DeserializeVfVlan(f.Value).Vlan)
+						}
+					case nl.IFLA_VF_LINK_STATE:
+						if len(f.Value) >= nl.SizeofVfLinkState {
+							st.LinkState = nl.DeserializeVfLinkState(f.Value).LinkState
 						}
 					case nl.IFLA_VF_RATE:
 						// struct ifla_vf_rate { vf, min_tx_rate, max_tx_rate }
 						if len(f.Value) >= nl.SizeofVfRate {
 							rateVf = int(native.Uint32(f.Value[0:4]))
+							st.MinTxRate = native.Uint32(f.Value[4:8])
 							st.MaxTxRate = native.Uint32(f.Value[8:12])
 						}
 					case nl.IFLA_VF_STATS:

@@ -259,7 +259,7 @@ dranet_vfio_pf_link_advertised_max_speed_mbps{` + pf + `} 25000
 # HELP dranet_vfio_pf_link_info The PF's duplex, autonegotiation, eswitch mode and bound driver.
 # TYPE dranet_vfio_pf_link_info gauge
 dranet_vfio_pf_link_info{autoneg="on",driver="mlx5_core",duplex="full",eswitch_mode="switchdev",` + pf + `} 1
-# HELP dranet_vfio_pf_link_speed_mbps Speed of the PF's link in Mb/s.
+# HELP dranet_vfio_pf_link_speed_mbps Speed of the PF's link in Mb/s while it is up.
 # TYPE dranet_vfio_pf_link_speed_mbps gauge
 dranet_vfio_pf_link_speed_mbps{` + pf + `} 25000
 # HELP dranet_vfio_pf_link_supported_max_speed_mbps Fastest link mode the PF supports, in Mb/s.
@@ -398,25 +398,70 @@ func TestTelemetryNoDropsInSwitchdevMode(t *testing.T) {
 }
 
 // rtnetlink reports zeros for a PF driver that fills no VF counters, so
-// only mlx5's are exported.
+// only the listed drivers' are exported.
 func TestTelemetryUnverifiedDriver(t *testing.T) {
-	for name, setup := range map[string]func(f *telemetryFixture){
-		"other driver":   func(f *telemetryFixture) { f.sysfs.driver[telPF] = "ice" },
-		"unknown driver": func(f *telemetryFixture) { delete(f.sysfs.driver, telPF) },
+	for name, tc := range map[string]struct {
+		driver string
+		mode   string
+	}{
+		"other driver":   {"ixgbe", "legacy"},
+		"unknown driver": {"", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newTelemetryFixture()
-			setup(f)
+			if tc.driver == "" {
+				delete(f.sysfs.driver, telPF)
+			} else {
+				f.sysfs.driver[telPF] = tc.driver
+			}
 			f.netlink.eswitchMode[telPF] = "legacy"
 			a := f.holders[telVF][0]
 			got := scrape(t, f.tel)
 			expectSeries(t, got, map[string]float64{
-				vfSeries("dranet_vfio_vf_stats_info", telVF, 2, a, telStart, "counters", "unverified", "drops", "unsupported"): 1,
-				vfSeries("dranet_vfio_vf_max_tx_rate_mbps", telVF, 2, a, telStart):                                             1000,
+				vfSeries("dranet_vfio_vf_stats_info", telVF, 2, a, telStart, "counters", "unverified", "drops", "unsupported"):        1,
+				vfSeries("dranet_vfio_vf_max_tx_rate_mbps", telVF, 2, a, telStart):                                                    1000,
+				pfSeries("dranet_vfio_pf_link_info", "duplex", "full", "autoneg", "on", "eswitch_mode", tc.mode, "driver", tc.driver): 1,
 			})
 			expectAbsent(t, got, "dranet_vfio_vf_rx_", "dranet_vfio_vf_tx_")
 		})
 	}
+}
+
+// A PF driver other than mlx5 has no eswitch mode: its VFs are legacy,
+// drops included, whatever devlink answers.
+func TestTelemetryLegacyDriver(t *testing.T) {
+	for _, driver := range []string{"i40e", "ice"} {
+		t.Run(driver, func(t *testing.T) {
+			f := newTelemetryFixture()
+			f.sysfs.driver[telPF] = driver
+			f.netlink.eswitchMode[telPF] = ""
+			a := f.holders[telVF][0]
+			f.set(2, vfCounters{100, 200, 1, 2, 0, 0, 10, 20})
+			got := scrape(t, f.tel)
+			expectSeries(t, got, map[string]float64{
+				vfSeries("dranet_vfio_vf_stats_info", telVF, 2, a, telStart, "counters", "supported", "drops", "supported"):         1,
+				vfSeries("dranet_vfio_vf_rx_bytes_total", telVF, 2, a, telStart):                                                    0,
+				vfSeries("dranet_vfio_vf_tx_dropped_total", telVF, 2, a, telStart):                                                  0,
+				pfSeries("dranet_vfio_pf_link_info", "duplex", "full", "autoneg", "on", "eswitch_mode", "legacy", "driver", driver): 1,
+			})
+		})
+	}
+}
+
+// A link that is down exports no speed, whatever the driver still reports;
+// its capabilities stay.
+func TestTelemetryLinkDownHasNoSpeed(t *testing.T) {
+	f := newTelemetryFixture()
+	link := f.ethtool.links[telPFName]
+	link.Link = false
+	f.ethtool.links[telPFName] = link
+	got := scrape(t, f.tel)
+	expectAbsent(t, got, "dranet_vfio_pf_link_speed_mbps")
+	expectSeries(t, got, map[string]float64{
+		pfSeries("dranet_vfio_pf_link_up"):                        0,
+		pfSeries("dranet_vfio_pf_link_supported_max_speed_mbps"):  100000,
+		pfSeries("dranet_vfio_pf_link_advertised_max_speed_mbps"): 25000,
+	})
 }
 
 func TestTelemetryInfiniband(t *testing.T) {
