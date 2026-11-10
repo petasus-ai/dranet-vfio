@@ -511,8 +511,13 @@ func (inv *Inventory) buildDevice(spec *Spec, up *uplinkState) resourceapi.Devic
 	if spec.RDMADevice != "" {
 		device.Attributes[AttrDomain+"/rdmaDevice"] = resourceapi.DeviceAttribute{StringValue: ptr.To(spec.RDMADevice)}
 	}
+	// The NUMA node also goes out under the standard name the other DRA
+	// drivers publish, so a claim can keep this function on the NUMA node of
+	// its GPU or CPUs with matchAttribute. A scalar, absent when sysfs reports
+	// none: in such a constraint -1 would match every other NUMA-less device.
 	if numa, err := inv.sysfs.GetNumaNode(spec.PCIAddress); err == nil && numa >= 0 {
 		device.Attributes[AttrDomain+"/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(numa))}
+		device.Attributes[deviceattribute.StandardDeviceAttributeNUMANode] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(numa))}
 	}
 	vendor := ""
 	if v, err := inv.sysfs.GetVendorID(spec.PCIAddress); err == nil && v != "" {

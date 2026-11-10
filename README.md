@@ -16,7 +16,9 @@ Driver name: `vfio.petasus.io`.
   published attributes.
 
   Each device is published as a ResourceSlice device `pci-<bdf>` with the
-  standard `resource.kubernetes.io/pciBusID` attribute and
+  standard `resource.kubernetes.io/pciBusID` and
+  `resource.kubernetes.io/numaNode` attributes (the NUMA node as a scalar,
+  absent when the function has none) and
   `vfio.petasus.io/{nodeName,kind,linkType,vendor,deviceID,pfName,pfPciAddress,vfIndex,iommuGroup,pciClass,numaNode,deviceType,rdmaCapable}`
   (`nodeName` is the node the slice is published for, so a DeviceClass CEL
   can select a parent PF per node — CEL sees device attributes only)

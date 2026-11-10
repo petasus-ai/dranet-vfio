@@ -161,6 +161,35 @@ func TestBuildDevices(t *testing.T) {
 // TestBuildDevicesUplinkLinkSpeed: a VF whose PF is a bond member publishes
 // the bond's speed apart from the PF's; a PF that is its own uplink, or a
 // bond without link, publishes none.
+// A function's NUMA node is published under the driver's name and the
+// standard one; a function without a NUMA node publishes neither.
+func TestBuildDevicesNUMANode(t *testing.T) {
+	b := inventoryFixture(t)
+	b.writeFile("1", "bus/pci/devices/0000:08:00.2/numa_node")
+	b.writeFile("-1", "bus/pci/devices/0000:08:00.3/numa_node")
+	inv := New("node-1", WithSysfs(b.ops()))
+
+	devices, _ := inv.buildDevices()
+	byName := map[string]resourceapi.Device{}
+	for _, dev := range devices {
+		byName[dev.Name] = dev
+	}
+
+	names := []resourceapi.QualifiedName{AttrDomain + "/numaNode", deviceattribute.StandardDeviceAttributeNUMANode}
+	for _, name := range names {
+		attr, ok := byName["pci-0000-08-00-2"].Attributes[name]
+		if !ok || attr.IntValue == nil || *attr.IntValue != 1 {
+			t.Fatalf("%s: expected NUMA node 1, got %#v", name, attr)
+		}
+		// 08:00.3 reports -1 and 0c:00.2 has no numa_node file.
+		for _, dev := range []string{"pci-0000-08-00-3", "pci-0000-0c-00-2"} {
+			if attr, ok := byName[dev].Attributes[name]; ok {
+				t.Fatalf("%s: %s must be absent without a NUMA node, got %#v", dev, name, attr)
+			}
+		}
+	}
+}
+
 func TestBuildDevicesUplinkLinkSpeed(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
